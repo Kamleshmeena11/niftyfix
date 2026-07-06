@@ -1,1 +1,6 @@
-
+fyers-apiv3
+requests
+pyotp
+google-auth
+google-auth-oauthlib
+google-api-python-client
