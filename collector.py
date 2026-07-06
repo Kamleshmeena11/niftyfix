@@ -88,17 +88,6 @@ def wait_until_market_open():
 
 # =====================================================================
 # 1-SECOND CANDLE STATE
-#
-# Logic (exactly as requested):
-#   Open  = price of the FIRST tick seen in that second
-#   Close = price of the LAST  tick seen in that second
-#   High  = max price across all ticks in that second
-#   Low   = min price across all ticks in that second
-#
-# A candle for second N is only known to be "finished" once a tick
-# from a later second arrives — there's no other signal that no more
-# trades are coming for second N. That one-tick lag before writing is
-# unavoidable in a live stream (not a bug).
 # =====================================================================
 current_bar_second = None
 o = h = l = c = None
@@ -111,7 +100,11 @@ if not os.path.exists(DATA_FILE):
 
 
 def _write_bar(second, o_, h_, l_, c_, vol_):
-    ts  = datetime.datetime.fromtimestamp(second, IST).strftime("%Y-%m-%d %H:%M:%S")
+    # Convert epoch timestamp to strict UTC first, then project to IST
+    utc_dt = datetime.datetime.fromtimestamp(second, tz=datetime.timezone.utc)
+    ist_dt = utc_dt.astimezone(IST)
+    ts  = ist_dt.strftime("%Y-%m-%d %H:%M:%S")
+    
     row = f"{ts},{o_},{h_},{l_},{c_},{vol_}\n"
     with open(DATA_FILE, "a") as f:
         f.write(row)
@@ -121,14 +114,12 @@ def _write_bar(second, o_, h_, l_, c_, vol_):
 def _start_new_bar(second, price, vol):
     global current_bar_second, o, h, l, c, bar_start_vol, last_vol
     current_bar_second = second
-    o = h = l = c = price          # Open = this (first) tick's price
+    o = h = l = c = price          
     bar_start_vol = vol
     last_vol      = vol
 
 
 def _flush_current_bar():
-    """Write whatever candle is currently open. Called on shutdown so the
-    last second of the session isn't silently dropped."""
     global current_bar_second
     if current_bar_second is None:
         return
@@ -152,35 +143,30 @@ def on_message(message):
     if price is None:
         return
 
-    vol = message.get("vol_traded_today", 0)   # correct field name; 0/absent is normal for an index
+    vol = message.get("vol_traded_today", 0)   
 
     exch_ts = message.get("exch_feed_time") or message.get("last_traded_time")
     if not exch_ts:
-        # Only happens if litemode=True strips these fields — keep
-        # litemode=False (below) so this fallback should never trigger.
         exch_ts = time.time()
     tick_second = int(exch_ts)
 
     if current_bar_second is None:
-        # First tick of the whole session — just opens the bucket.
         _start_new_bar(tick_second, price, vol)
         return
 
     if tick_second == current_bar_second:
-        # Still inside the same second → fold this tick into the open candle.
-        h        = max(h, price)          # High = max seen this second
-        l        = min(l, price)          # Low  = min seen this second
-        c        = price                  # Close = latest tick's price
+        h        = max(h, price)          
+        l        = min(l, price)          
+        c        = price                  
         last_vol = vol
     else:
-        # A tick from a new second arrived → the previous second is done.
         bar_volume = (
             (last_vol - bar_start_vol)
             if (last_vol is not None and bar_start_vol is not None)
             else 0
         )
         _write_bar(current_bar_second, o, h, l, c, bar_volume)
-        _start_new_bar(tick_second, price, vol)   # this tick opens the new candle
+        _start_new_bar(tick_second, price, vol)   
 
 
 def on_error(message):
@@ -188,7 +174,7 @@ def on_error(message):
 
 
 def on_close(message):
-    _flush_current_bar()   # don't lose the last (still-open) candle
+    _flush_current_bar()   
     if time.time() - start_time >= MAX_RUNTIME_SECONDS:
         return
     print("🔌 Connection closed — reconnecting in 5 s …")
@@ -357,7 +343,7 @@ if __name__ == "__main__":
     fyers_ws = data_ws.FyersDataSocket(
         access_token=f"{CLIENT_ID}:{token}",
         log_path=os.getcwd(),
-        litemode=False,   # required — full mode is what provides exch_feed_time / vol_traded_today
+        litemode=False,   
         on_connect=on_open,
         on_message=on_message,
         on_error=on_error,
