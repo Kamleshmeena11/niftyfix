@@ -3,7 +3,7 @@ name: 📈 Nifty 1s Bar Collector
 on:
   schedule:
     # 09:10 IST = 03:40 UTC — 5 min buffer before 09:15 market open
-    - cron: "55 6 * * *"
+    - cron: "40 3 * * 1-5"
   workflow_dispatch:
 
 jobs:
