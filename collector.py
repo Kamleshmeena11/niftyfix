@@ -238,6 +238,13 @@ def get_drive_service():
 _drive_service_cache = {}
 _drive_daily_folder_id_cache = {}
 
+# Safety flags: sync_all_to_drive() must NEVER upload a file that could be
+# missing prior history. These start False and are only set True once we're
+# CERTAIN the local file's contents are safe to push (either we successfully
+# downloaded what was already there, or we confirmed nothing exists yet).
+_daily_safe_to_sync = False
+_combined_safe_to_sync = False
+
 
 def _get_service():
     if "service" not in _drive_service_cache:
@@ -302,20 +309,46 @@ def upload_or_update_drive(local_path, parent_id):
 
 
 def sync_all_to_drive():
+    global _daily_safe_to_sync, _combined_safe_to_sync
     service = _get_service()
     daily_folder_id = _get_or_create_daily_subfolder(service)
-    # Day's file goes inside the daily_bars sub-folder on Drive
-    upload_or_update_drive(DAILY_FILE, daily_folder_id)
-    # Combined file stays in the top-level Drive folder
-    upload_or_update_drive(COMBINED_FILE, DRIVE_FOLDER_ID)
+
+    if _daily_safe_to_sync:
+        upload_or_update_drive(DAILY_FILE, daily_folder_id)
+    else:
+        print("⏸️  Skipping daily-file sync — not yet confirmed safe (retrying bootstrap).")
+        try:
+            result = _download_from_drive(
+                service, os.path.basename(DAILY_FILE), daily_folder_id, DAILY_FILE
+            )
+            _daily_safe_to_sync = True
+            print(f"⬇️  Daily file now confirmed ({result}).")
+        except Exception as e:
+            print(f"⚠️  Still can't confirm daily file: {e}")
+
+    if _combined_safe_to_sync:
+        upload_or_update_drive(COMBINED_FILE, DRIVE_FOLDER_ID)
+    else:
+        print("⏸️  Skipping combined-file sync — not yet confirmed safe (retrying bootstrap).")
+        try:
+            result = _download_from_drive(
+                service, os.path.basename(COMBINED_FILE), DRIVE_FOLDER_ID, COMBINED_FILE
+            )
+            _combined_safe_to_sync = True
+            print(f"⬇️  Combined file now confirmed ({result}).")
+        except Exception as e:
+            print(f"⚠️  Still can't confirm combined file: {e}")
 
 
 def _download_from_drive(service, filename, parent_id, local_path):
-    """Pulls an existing file down from Drive into local_path, if it exists.
-    Returns True if something was downloaded."""
+    """Pulls an existing file down from Drive into local_path.
+    Returns 'downloaded' if a file was found and pulled down,
+    'none_found' if Drive confirmed no such file exists (safe — nothing to
+    lose), or raises an exception if the check itself failed (unsafe —
+    caller must NOT treat this as safe to overwrite)."""
     file_id = _find_drive_file_id(service, filename, parent_id)
     if not file_id:
-        return False
+        return "none_found"
     request = service.files().get_media(fileId=file_id)
     buf = io.BytesIO()
     downloader = MediaIoBaseDownload(buf, request)
@@ -324,32 +357,49 @@ def _download_from_drive(service, filename, parent_id, local_path):
         _, done = downloader.next_chunk()
     with open(local_path, "wb") as f:
         f.write(buf.getvalue())
-    return True
+    return "downloaded"
 
 
 def bootstrap_local_files():
     """Runs once at startup. GitHub Actions checks out a clean repo every run,
-    so local CSVs start empty. To avoid the sync step overwriting Drive with an
-    (almost) empty file, pull down whatever already exists there first —
-    today's daily file (in case this is a rerun) and the full combined file —
-    then only fall back to a fresh header if nothing was found."""
+    so local CSVs start empty. If we blindly let the sync step push that empty
+    local file to Drive, it would erase everything already stored there. So:
+    for each file, either confirm we pulled down the existing Drive copy, or
+    confirm (via a successful, error-free check) that Drive truly has nothing
+    yet. Only in those two cases is it marked safe to sync. If the Drive
+    check itself errors out, we do NOT fall back to a fresh/empty file for
+    that target — we keep retrying in the background sync loop until we can
+    verify it safely, so we never risk overwriting real history with a stub."""
+    global _daily_safe_to_sync, _combined_safe_to_sync
+
     try:
         service = _get_service()
         daily_folder_id = _get_or_create_daily_subfolder(service)
 
-        got_daily = _download_from_drive(
+        result = _download_from_drive(
             service, os.path.basename(DAILY_FILE), daily_folder_id, DAILY_FILE
         )
-        print(f"⬇️  {'Resumed' if got_daily else 'No existing'} daily file from Drive.")
+        _daily_safe_to_sync = True
+        print(f"⬇️  Daily file: {result} (safe to sync).")
+    except Exception as e:
+        print(f"⚠️  Could not verify daily file against Drive yet: {e} — will retry, NOT syncing until confirmed.")
 
-        got_combined = _download_from_drive(
+    try:
+        service = _get_service()
+        result = _download_from_drive(
             service, os.path.basename(COMBINED_FILE), DRIVE_FOLDER_ID, COMBINED_FILE
         )
-        print(f"⬇️  {'Resumed' if got_combined else 'No existing'} combined file from Drive.")
+        _combined_safe_to_sync = True
+        print(f"⬇️  Combined file: {result} (safe to sync).")
     except Exception as e:
-        print(f"⚠️  Drive bootstrap failed, starting from local/fresh files: {e}")
+        print(f"⚠️  Could not verify combined file against Drive yet: {e} — will retry, NOT syncing until confirmed.")
 
-    # Fall back to a fresh header-only file for anything still missing locally
+    # Only create a fresh header-only file locally if we've CONFIRMED (not
+    # assumed) there's nothing on Drive to lose, or the flag is still pending
+    # and the file simply doesn't exist locally yet so writers have something
+    # to append to. This local stub is harmless by itself — it only becomes
+    # risky if uploaded before the safety flag is set, which sync_all_to_drive
+    # now guards against directly.
     for _f in (DAILY_FILE, COMBINED_FILE):
         if not os.path.exists(_f):
             with open(_f, "w") as fh:
