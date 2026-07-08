@@ -5,7 +5,8 @@ from fyers_apiv3.FyersWebsocket import data_ws
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+import io
 
 # =====================================================================
 # CONFIGURATION — loaded from environment variables (GitHub Secrets).
@@ -32,7 +33,7 @@ GOOGLE_REFRESH_TOKEN  = _require_env("GOOGLE_REFRESH_TOKEN")
 
 CLIENT_ID       = f"{APP_ID}-{APP_TYPE}"
 SYMBOL          = "NSE:NIFTY50-INDEX"
-DATA_FILE       = "candles_1s.csv"
+
 DRIVE_SYNC_INTERVAL_SECONDS = 5
 GOOGLE_SCOPES   = ["https://www.googleapis.com/auth/drive.file"]
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID") or None
@@ -42,6 +43,23 @@ MARKET_OPEN_IST_MINUTE  = 15
 MARKET_CLOSE_IST_HOUR   = 15
 MARKET_CLOSE_IST_MINUTE = 35
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+
+# =====================================================================
+# FILE LAYOUT
+#   daily_bars/candles_1s_2026-07-08.csv   <- one file per trading day
+#   candles_1s_all.csv                     <- every day's rows, combined,
+#                                              lives outside the folder
+# =====================================================================
+DAILY_FOLDER_NAME = "daily_bars"
+DRIVE_DAILY_SUBFOLDER_NAME = "daily_bars"   # matching sub-folder on Drive
+
+TODAY_STR   = datetime.datetime.now(IST).strftime("%Y-%m-%d")
+DAILY_FILE  = os.path.join(DAILY_FOLDER_NAME, f"candles_1s_{TODAY_STR}.csv")
+COMBINED_FILE = "candles_1s_all.csv"
+
+CSV_HEADER = "Timestamp,Open,High,Low,Close,Volume\n"
+
+os.makedirs(DAILY_FOLDER_NAME, exist_ok=True)
 
 BASE_URL              = "https://api-t2.fyers.in/vagator/v2"
 BASE_URL_2            = "https://api-t1.fyers.in/api/v3"
@@ -94,27 +112,28 @@ o = h = l = c = None
 bar_start_vol = None
 last_vol      = None
 
-if not os.path.exists(DATA_FILE):
-    with open(DATA_FILE, "w") as f:
-        f.write("Timestamp,Open,High,Low,Close,Volume\n")
-
 
 def _write_bar(second, o_, h_, l_, c_, vol_):
     # Convert epoch timestamp to strict UTC first, then project to IST
     utc_dt = datetime.datetime.fromtimestamp(second, tz=datetime.timezone.utc)
     ist_dt = utc_dt.astimezone(IST)
     ts  = ist_dt.strftime("%Y-%m-%d %H:%M:%S")
-    
+
     row = f"{ts},{o_},{h_},{l_},{c_},{vol_}\n"
-    with open(DATA_FILE, "a") as f:
+
+    # Write to BOTH the day's own file and the running combined file
+    with open(DAILY_FILE, "a") as f:
         f.write(row)
+    with open(COMBINED_FILE, "a") as f:
+        f.write(row)
+
     print(f"🕐 1s Candle: {row.strip()}")
 
 
 def _start_new_bar(second, price, vol):
     global current_bar_second, o, h, l, c, bar_start_vol, last_vol
     current_bar_second = second
-    o = h = l = c = price          
+    o = h = l = c = price
     bar_start_vol = vol
     last_vol      = vol
 
@@ -143,7 +162,7 @@ def on_message(message):
     if price is None:
         return
 
-    vol = message.get("vol_traded_today", 0)   
+    vol = message.get("vol_traded_today", 0)
 
     exch_ts = message.get("exch_feed_time") or message.get("last_traded_time")
     if not exch_ts:
@@ -155,9 +174,9 @@ def on_message(message):
         return
 
     if tick_second == current_bar_second:
-        h        = max(h, price)          
-        l        = min(l, price)          
-        c        = price                  
+        h        = max(h, price)
+        l        = min(l, price)
+        c        = price
         last_vol = vol
     else:
         bar_volume = (
@@ -166,7 +185,7 @@ def on_message(message):
             else 0
         )
         _write_bar(current_bar_second, o, h, l, c, bar_volume)
-        _start_new_bar(tick_second, price, vol)   
+        _start_new_bar(tick_second, price, vol)
 
 
 def on_error(message):
@@ -174,7 +193,7 @@ def on_error(message):
 
 
 def on_close(message):
-    _flush_current_bar()   
+    _flush_current_bar()
     if time.time() - start_time >= MAX_RUNTIME_SECONDS:
         return
     print("🔌 Connection closed — reconnecting in 5 s …")
@@ -197,7 +216,7 @@ def runtime_watchdog():
     print("⏱️  Session end reached — flushing last candle + final Drive sync …")
     _flush_current_bar()
     try:
-        upload_or_update_drive(DATA_FILE)
+        sync_all_to_drive()
     except Exception as e:
         print(f"⚠️  Final Drive sync failed: {e}")
     os._exit(0)
@@ -216,40 +235,133 @@ def get_drive_service():
     return build("drive", "v3", credentials=creds)
 
 
-def _find_drive_file_id(service, filename):
+_drive_service_cache = {}
+_drive_daily_folder_id_cache = {}
+
+
+def _get_service():
+    if "service" not in _drive_service_cache:
+        _drive_service_cache["service"] = get_drive_service()
+    return _drive_service_cache["service"]
+
+
+def _find_drive_file_id(service, filename, parent_id):
     query = f"name = '{filename}' and trashed = false"
-    if DRIVE_FOLDER_ID:
-        query += f" and '{DRIVE_FOLDER_ID}' in parents"
+    if parent_id:
+        query += f" and '{parent_id}' in parents"
     results = service.files().list(q=query, spaces="drive", fields="files(id, name)").execute()
     files = results.get("files", [])
     return files[0]["id"] if files else None
 
 
-_drive_service_cache = {}
+def _get_or_create_daily_subfolder(service):
+    """Finds (or creates) the Drive sub-folder that mirrors DAILY_FOLDER_NAME,
+    nested under DRIVE_FOLDER_ID (or Drive root if that isn't set)."""
+    if "id" in _drive_daily_folder_id_cache:
+        return _drive_daily_folder_id_cache["id"]
 
-def upload_or_update_drive(local_path):
-    if "service" not in _drive_service_cache:
-        _drive_service_cache["service"] = get_drive_service()
-    service  = _drive_service_cache["service"]
+    query = (
+        f"name = '{DRIVE_DAILY_SUBFOLDER_NAME}' and trashed = false "
+        f"and mimeType = 'application/vnd.google-apps.folder'"
+    )
+    if DRIVE_FOLDER_ID:
+        query += f" and '{DRIVE_FOLDER_ID}' in parents"
+    results = service.files().list(q=query, spaces="drive", fields="files(id, name)").execute()
+    files = results.get("files", [])
+
+    if files:
+        folder_id = files[0]["id"]
+    else:
+        metadata = {
+            "name": DRIVE_DAILY_SUBFOLDER_NAME,
+            "mimeType": "application/vnd.google-apps.folder",
+        }
+        if DRIVE_FOLDER_ID:
+            metadata["parents"] = [DRIVE_FOLDER_ID]
+        folder = service.files().create(body=metadata, fields="id").execute()
+        folder_id = folder["id"]
+        print(f"📁 Created Drive folder '{DRIVE_DAILY_SUBFOLDER_NAME}'.")
+
+    _drive_daily_folder_id_cache["id"] = folder_id
+    return folder_id
+
+
+def upload_or_update_drive(local_path, parent_id):
+    service  = _get_service()
     filename = os.path.basename(local_path)
     media    = MediaFileUpload(local_path, mimetype="text/csv", resumable=True)
-    existing_id = _find_drive_file_id(service, filename)
+    existing_id = _find_drive_file_id(service, filename, parent_id)
     if existing_id:
         service.files().update(fileId=existing_id, media_body=media).execute()
     else:
         metadata = {"name": filename}
-        if DRIVE_FOLDER_ID:
-            metadata["parents"] = [DRIVE_FOLDER_ID]
+        if parent_id:
+            metadata["parents"] = [parent_id]
         service.files().create(body=metadata, media_body=media, fields="id").execute()
     print(f"☁️  Synced '{filename}' → Google Drive.")
 
 
+def sync_all_to_drive():
+    service = _get_service()
+    daily_folder_id = _get_or_create_daily_subfolder(service)
+    # Day's file goes inside the daily_bars sub-folder on Drive
+    upload_or_update_drive(DAILY_FILE, daily_folder_id)
+    # Combined file stays in the top-level Drive folder
+    upload_or_update_drive(COMBINED_FILE, DRIVE_FOLDER_ID)
+
+
+def _download_from_drive(service, filename, parent_id, local_path):
+    """Pulls an existing file down from Drive into local_path, if it exists.
+    Returns True if something was downloaded."""
+    file_id = _find_drive_file_id(service, filename, parent_id)
+    if not file_id:
+        return False
+    request = service.files().get_media(fileId=file_id)
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    with open(local_path, "wb") as f:
+        f.write(buf.getvalue())
+    return True
+
+
+def bootstrap_local_files():
+    """Runs once at startup. GitHub Actions checks out a clean repo every run,
+    so local CSVs start empty. To avoid the sync step overwriting Drive with an
+    (almost) empty file, pull down whatever already exists there first —
+    today's daily file (in case this is a rerun) and the full combined file —
+    then only fall back to a fresh header if nothing was found."""
+    try:
+        service = _get_service()
+        daily_folder_id = _get_or_create_daily_subfolder(service)
+
+        got_daily = _download_from_drive(
+            service, os.path.basename(DAILY_FILE), daily_folder_id, DAILY_FILE
+        )
+        print(f"⬇️  {'Resumed' if got_daily else 'No existing'} daily file from Drive.")
+
+        got_combined = _download_from_drive(
+            service, os.path.basename(COMBINED_FILE), DRIVE_FOLDER_ID, COMBINED_FILE
+        )
+        print(f"⬇️  {'Resumed' if got_combined else 'No existing'} combined file from Drive.")
+    except Exception as e:
+        print(f"⚠️  Drive bootstrap failed, starting from local/fresh files: {e}")
+
+    # Fall back to a fresh header-only file for anything still missing locally
+    for _f in (DAILY_FILE, COMBINED_FILE):
+        if not os.path.exists(_f):
+            with open(_f, "w") as fh:
+                fh.write(CSV_HEADER)
+
+
 def drive_sync_loop():
-    while not os.path.exists(DATA_FILE):
+    while not (os.path.exists(DAILY_FILE) and os.path.exists(COMBINED_FILE)):
         time.sleep(2)
     while True:
         try:
-            upload_or_update_drive(DATA_FILE)
+            sync_all_to_drive()
         except Exception as e:
             print(f"⚠️  Drive sync error: {e}")
         time.sleep(DRIVE_SYNC_INTERVAL_SECONDS)
@@ -334,8 +446,12 @@ if __name__ == "__main__":
     MAX_RUNTIME_SECONDS = compute_max_runtime_seconds()
     start_time = time.time()
     print(f"⏱️  Auto-stop in {MAX_RUNTIME_SECONDS}s.")
+    print(f"📄 Today's file: {DAILY_FILE}")
+    print(f"📄 Combined file: {COMBINED_FILE}")
 
     token = totp_login()
+
+    bootstrap_local_files()
 
     threading.Thread(target=drive_sync_loop,  daemon=True).start()
     threading.Thread(target=runtime_watchdog, daemon=True).start()
@@ -343,7 +459,7 @@ if __name__ == "__main__":
     fyers_ws = data_ws.FyersDataSocket(
         access_token=f"{CLIENT_ID}:{token}",
         log_path=os.getcwd(),
-        litemode=False,   
+        litemode=False,
         on_connect=on_open,
         on_message=on_message,
         on_error=on_error,
