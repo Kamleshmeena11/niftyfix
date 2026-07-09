@@ -175,24 +175,26 @@ def on_message(message):
         _start_new_bar(tick_second, price, vol)
         return
 
+    # If it's the exact same second, update High, Low, and track the Closing candidate
     if tick_second == current_bar_second:
         h        = max(h, price)
         l        = min(l, price)
         c        = price
         last_vol = vol
     else:
-        # Close out and write the completed bar state
-        bar_volume = (
-            (last_vol - bar_start_vol)
-            if (last_vol is not None and bar_start_vol is not None)
-            else 0
-        )
+        # 1. The second has changed! Lock the previous bar's state safely FIRST
+        prev_bar_second = current_bar_second
+        prev_o, prev_h, prev_l, prev_c = o, h, l, c
+        
+        bar_volume = (last_vol - bar_start_vol) if (last_vol is not None and bar_start_vol is not None) else 0
         if bar_volume < 0:
             bar_volume = 0
-        _write_bar(current_bar_second, o, h, l, c, bar_volume)
-        
-        # Micro-second shift setup for the incoming live bar frame
+            
+        # 2. Immediately spin up the fresh bar's state so no incoming ticks are dropped
         _start_new_bar(tick_second, price, vol)
+        
+        # 3. Write out the completed historical data snapshot cleanly
+        _write_bar(prev_bar_second, prev_o, prev_h, prev_l, prev_c, bar_volume)
 
 
 def on_error(message):
