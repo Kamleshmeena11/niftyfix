@@ -139,7 +139,7 @@ def _start_new_bar(second, price, vol):
 
 
 def _flush_current_bar():
-    global current_bar_second
+    global current_bar_second, o, h, l, c, bar_start_vol, last_vol
     if current_bar_second is None:
         return
     bar_volume = (
@@ -147,6 +147,8 @@ def _flush_current_bar():
         if (last_vol is not None and bar_start_vol is not None)
         else 0
     )
+    if bar_volume < 0:
+        bar_volume = 0
     _write_bar(current_bar_second, o, h, l, c, bar_volume)
     current_bar_second = None
 
@@ -154,7 +156,7 @@ def _flush_current_bar():
 # WEBSOCKET CALLBACKS
 # =====================================================================
 def on_message(message):
-    global o, h, l, c, last_vol
+    global o, h, l, c, last_vol, bar_start_vol, current_bar_second
 
     if "ltp" not in message:
         return
@@ -179,12 +181,17 @@ def on_message(message):
         c        = price
         last_vol = vol
     else:
+        # Close out and write the completed bar state
         bar_volume = (
             (last_vol - bar_start_vol)
             if (last_vol is not None and bar_start_vol is not None)
             else 0
         )
+        if bar_volume < 0:
+            bar_volume = 0
         _write_bar(current_bar_second, o, h, l, c, bar_volume)
+        
+        # Micro-second shift setup for the incoming live bar frame
         _start_new_bar(tick_second, price, vol)
 
 
