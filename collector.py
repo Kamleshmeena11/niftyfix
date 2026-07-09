@@ -467,26 +467,51 @@ def get_auth_code(trade_access_token):
 
 
 def totp_login():
-    print("🔑 Running fully automatic TOTP login …")
-    status, request_key = send_login_otp()
-    if status != SUCCESS: print(f"❌ send_login_otp failed: {request_key}"); sys.exit(1)
-    status, request_key = verify_totp(request_key)
-    if status != SUCCESS: print(f"❌ verify_totp failed: {request_key}"); sys.exit(1)
-    status, trade_token = verify_pin(request_key)
-    if status != SUCCESS: print(f"❌ verify_pin failed: {trade_token}"); sys.exit(1)
-    status, auth_code = get_auth_code(trade_token)
-    if status != SUCCESS: print(f"❌ get_auth_code failed: {auth_code}"); sys.exit(1)
+    max_retries = 5
+    for attempt in range(max_retries):
+        print(f"🔑 Running fully automatic TOTP login (Attempt {attempt + 1}/{max_retries}) …")
+        
+        status, request_key = send_login_otp()
+        if status != SUCCESS:
+            print(f"⚠️ send_login_otp failed: {request_key}")
+            time.sleep(10)
+            continue
+            
+        status, request_key = verify_totp(request_key)
+        if status != SUCCESS:
+            print(f"⚠️ verify_totp failed: {request_key}")
+            time.sleep(10)
+            continue
+            
+        status, trade_token = verify_pin(request_key)
+        if status != SUCCESS:
+            print(f"⚠️ verify_pin failed: {trade_token}")
+            time.sleep(10)
+            continue
+            
+        status, auth_code = get_auth_code(trade_token)
+        if status != SUCCESS:
+            print(f"⚠️ get_auth_code failed: {auth_code}")
+            time.sleep(10)
+            continue
 
-    session = fyersModel.SessionModel(
-        client_id=CLIENT_ID, secret_key=SECRET_KEY, redirect_uri=REDIRECT_URI,
-        response_type="code", grant_type="authorization_code",
-    )
-    session.set_token(auth_code)
-    response = session.generate_token()
-    if "access_token" not in response:
-        print(f"❌ generate_token failed: {response}"); sys.exit(1)
-    print("✅ Login successful.")
-    return response["access_token"]
+        session = fyersModel.SessionModel(
+            client_id=CLIENT_ID, secret_key=SECRET_KEY, redirect_uri=REDIRECT_URI,
+            response_type="code", grant_type="authorization_code",
+        )
+        session.set_token(auth_code)
+        response = session.generate_token()
+        
+        if "access_token" not in response:
+            print(f"⚠️ generate_token failed: {response}")
+            time.sleep(10)
+            continue
+            
+        print("✅ Login successful.")
+        return response["access_token"]
+        
+    print("❌ All login attempts failed after maximum retries.")
+    sys.exit(1)
 
 # =====================================================================
 # MAIN
