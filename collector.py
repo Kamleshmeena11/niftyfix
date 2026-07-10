@@ -434,8 +434,19 @@ def upload_or_update_drive(local_path, parent_id):
             metadata["parents"] = [str(parent_id).strip()]
         return service.files().create(body=metadata, media_body=media, fields="id")
 
-    _execute_with_retry(_req, what=f"upload '{filename}'")
-    print(f"☁️  Synced '{filename}' → Google Drive.")
+    try:
+        _execute_with_retry(_req, what=f"upload '{filename}'")
+        print(f"☁️  Synced '{filename}' → Google Drive.")
+    finally:
+        # FIX: a resumable upload's chunked request/response cycle
+        # reliably leaves the shared httplib2 connection in a state
+        # that corrupts the *next* API call on it (observed as an
+        # immediate 400 "malformed request" on the very next find/list
+        # call, regardless of which file it queries). Rather than
+        # waiting for that call to fail and retrying, proactively
+        # throw the connection away right after every upload so the
+        # next call always starts on a clean one.
+        _reset_drive_service()
 
 
 def sync_all_to_drive():
@@ -496,6 +507,12 @@ def _download_from_drive(filename, parent_id, local_path):
             print(f"⚠️  Drive download of '{filename}' failed, attempt {attempt}/3: {e}")
             _reset_drive_service()
             time.sleep(1.5 * attempt)
+        finally:
+            # Same reasoning as upload_or_update_drive: chunked
+            # resumable transfers can leave the connection in a state
+            # that corrupts the next call, so always start the next
+            # Drive call on a clean connection.
+            _reset_drive_service()
     raise last_err
 
 
