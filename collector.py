@@ -1,4 +1,4 @@
-import json, os, sys, time, datetime, threading, requests, pyotp
+import json, os, sys, time, datetime, threading, queue, requests, pyotp
 from urllib import parse
 from fyers_apiv3 import fyersModel
 from fyers_apiv3.FyersWebsocket import data_ws
@@ -59,6 +59,9 @@ COMBINED_FILE = "candles_1s_all.csv"
 
 CSV_HEADER = "Timestamp,Open,High,Low,Close,Volume\n"
 
+# Log file for tracking gaps / dropped-tick diagnostics separately from stdout
+GAP_LOG_FILE = os.path.join(DAILY_FOLDER_NAME, f"gaps_{TODAY_STR}.log")
+
 os.makedirs(DAILY_FOLDER_NAME, exist_ok=True)
 
 BASE_URL              = "https://api-t2.fyers.in/vagator/v2"
@@ -105,12 +108,43 @@ def wait_until_market_open():
         print(f"▶️  Market already open — starting immediately.")
 
 # =====================================================================
-# 1-SECOND CANDLE STATE
+# GAP / DIAGNOSTIC LOGGING
+# =====================================================================
+def log_gap(text):
+    """Writes to both stdout and a dedicated gap log so mismatches vs
+    Fyers' own 1s bars can be traced back to a cause (reconnect vs
+    missing exch_feed_time vs queue backlog) after the fact."""
+    line = f"[{datetime.datetime.now(IST).strftime('%H:%M:%S')}] {text}"
+    print(line)
+    try:
+        with open(GAP_LOG_FILE, "a") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+# =====================================================================
+# TICK QUEUE — decouples websocket receipt from bar-building/disk I/O
+# =====================================================================
+# FIX: on_message previously did bar aggregation *and* two blocking
+# file writes per bar directly inside the websocket callback thread.
+# If ticks arrive faster than that thread can drain them (or the OS
+# socket buffer briefly stalls behind slow I/O), the underlying socket
+# library can silently drop frames — no exception, no log, just a
+# missing tick that skews that second's H/L versus Fyers' own bar.
+#
+# Now on_message does the absolute minimum: timestamp + queue.put().
+# All aggregation/writing happens on a separate consumer thread that
+# can never block the network thread.
+tick_queue = queue.Queue()
+
+# =====================================================================
+# 1-SECOND CANDLE STATE (only touched by the consumer thread now)
 # =====================================================================
 current_bar_second = None
 o = h = l = c = None
 bar_start_vol = None
 last_vol      = None
+last_seen_second = None  # for gap detection across consecutive bars
 
 
 def _write_bar(second, o_, h_, l_, c_, vol_):
@@ -150,24 +184,18 @@ def _flush_current_bar():
     _write_bar(current_bar_second, o, h, l, c, bar_volume)
     current_bar_second = None
 
-# =====================================================================
-# WEBSOCKET CALLBACKS
-# =====================================================================
-def on_message(message):
-    global o, h, l, c, last_vol, bar_start_vol, current_bar_second
 
-    if "ltp" not in message:
-        return
-    price = message["ltp"]
-    if price is None:
-        return
+def _process_tick(price, vol, tick_second):
+    """Bar-building logic, now run only on the consumer thread."""
+    global o, h, l, c, last_vol, bar_start_vol, current_bar_second, last_seen_second
 
-    vol = message.get("vol_traded_today", 0)
-
-    exch_ts = message.get("exch_feed_time") or message.get("last_traded_time")
-    if not exch_ts:
-        exch_ts = time.time()
-    tick_second = int(exch_ts)
+    # Gap detection: if the incoming second jumps by more than 1 from
+    # the last one we processed, log it so mismatches can be traced.
+    if last_seen_second is not None and tick_second > last_seen_second + 1:
+        missing = tick_second - last_seen_second - 1
+        log_gap(f"⚠️  Gap detected: {missing} second(s) with no ticks "
+                 f"between {last_seen_second} and {tick_second}.")
+    last_seen_second = tick_second
 
     if current_bar_second is None:
         _start_new_bar(tick_second, price, vol)
@@ -178,7 +206,7 @@ def on_message(message):
         l        = min(l, price)
         c        = price
         last_vol = vol
-    else:
+    elif tick_second > current_bar_second:
         bar_volume = (
             (last_vol - bar_start_vol)
             if (last_vol is not None and bar_start_vol is not None)
@@ -188,6 +216,47 @@ def on_message(message):
             bar_volume = 0
         _write_bar(current_bar_second, o, h, l, c, bar_volume)
         _start_new_bar(tick_second, price, vol)
+    else:
+        # Out-of-order tick (arrived late, belongs to an already-closed
+        # bar). Previously this was impossible to hit because on_message
+        # only ever compared against "==" vs "else"; a late tick would
+        # have silently reopened a new bar in the past. Now we just log
+        # and drop it rather than corrupt the current bar.
+        log_gap(f"⚠️  Late/out-of-order tick for second {tick_second} "
+                 f"arrived after bar {current_bar_second} was already open — dropped.")
+
+
+def bar_builder_loop():
+    """Consumer thread: pulls ticks off the queue and builds bars.
+    Runs independently of the websocket thread so slow disk I/O here
+    can never cause the network thread to back up or drop frames."""
+    while True:
+        message = tick_queue.get()
+        if message is None:  # sentinel for shutdown
+            break
+        price = message["ltp"]
+        vol = message.get("vol_traded_today", 0)
+        exch_ts = message.get("exch_feed_time")
+        if exch_ts is None:
+            # FIX: previously fell back to last_traded_time or
+            # time.time() here, which mixes timestamp sources within
+            # one session and misfiles ticks into the wrong second
+            # bucket (looks exactly like a H/L mismatch vs Fyers).
+            log_gap(f"⚠️  Tick missing exch_feed_time, dropped to avoid "
+                     f"bucket corruption: {message}")
+            continue
+        _process_tick(price, vol, int(exch_ts))
+
+# =====================================================================
+# WEBSOCKET CALLBACKS
+# =====================================================================
+def on_message(message):
+    # FIX: this callback now does nothing but validate + enqueue.
+    # No aggregation, no file I/O, so it can never block the socket
+    # thread regardless of tick rate.
+    if "ltp" not in message or message["ltp"] is None:
+        return
+    tick_queue.put(message)
 
 
 def on_error(message):
@@ -195,10 +264,11 @@ def on_error(message):
 
 
 def on_close(message):
-    _flush_current_bar()
+    log_gap("🔌 Connection closed.")
     if time.time() - start_time >= MAX_RUNTIME_SECONDS:
         return
-    print("🔌 Connection closed — reconnecting in 5 s …")
+    log_gap("🔌 Reconnecting in 5 s — any ticks during this window will be missing "
+             "and may cause that second's bar to differ from Fyers' own data.")
     time.sleep(5)
     try:
         fyers_ws.connect()
@@ -216,6 +286,9 @@ def on_open():
 def runtime_watchdog():
     time.sleep(MAX_RUNTIME_SECONDS)
     print("⏱️  Session end reached — flushing last candle + final Drive sync …")
+    # Give the consumer thread a moment to drain any queued ticks
+    # before we flush, so the final bar isn't missing late-arriving data.
+    time.sleep(1)
     _flush_current_bar()
     try:
         sync_all_to_drive()
@@ -253,11 +326,11 @@ def _get_service():
 def _find_drive_file_id(service, filename, parent_id):
     """Safely builds the Google Drive search string to avoid 400 Bad Requests."""
     query_parts = [f"name = '{filename}'", "trashed = false"]
-    
+
     # Only append parent condition if parent_id is valid, non-empty, and not literal 'None' string
     if parent_id and str(parent_id).strip() and str(parent_id).strip() != "None":
         query_parts.append(f"'{str(parent_id).strip()}' in parents")
-        
+
     query = " and ".join(query_parts)
     results = service.files().list(q=query, spaces="drive", fields="files(id, name)").execute()
     files = results.get("files", [])
@@ -275,7 +348,7 @@ def _get_or_create_daily_subfolder(service):
     ]
     if DRIVE_FOLDER_ID and str(DRIVE_FOLDER_ID).strip() and str(DRIVE_FOLDER_ID).strip() != "None":
         query_parts.append(f"'{str(DRIVE_FOLDER_ID).strip()}' in parents")
-        
+
     query = " and ".join(query_parts)
     results = service.files().list(q=query, spaces="drive", fields="files(id, name)").execute()
     files = results.get("files", [])
@@ -454,25 +527,25 @@ def totp_login():
     max_retries = 5
     for attempt in range(max_retries):
         print(f"🔑 Running fully automatic TOTP login (Attempt {attempt + 1}/{max_retries}) …")
-        
+
         status, request_key = send_login_otp()
         if status != SUCCESS:
             print(f"⚠️ send_login_otp failed: {request_key}")
             time.sleep(10)
             continue
-            
+
         status, request_key = verify_totp(request_key)
         if status != SUCCESS:
             print(f"⚠️ verify_totp failed: {request_key}")
             time.sleep(10)
             continue
-            
+
         status, trade_token = verify_pin(request_key)
         if status != SUCCESS:
             print(f"⚠️ verify_pin failed: {trade_token}")
             time.sleep(10)
             continue
-            
+
         status, auth_code = get_auth_code(trade_token)
         if status != SUCCESS:
             print(f"⚠️ get_auth_code failed: {auth_code}")
@@ -485,15 +558,15 @@ def totp_login():
         )
         session.set_token(auth_code)
         response = session.generate_token()
-        
+
         if "access_token" not in response:
             print(f"⚠️ generate_token failed: {response}")
             time.sleep(10)
             continue
-            
+
         print("✅ Login successful.")
         return response["access_token"]
-        
+
     print("❌ All login attempts failed after maximum retries.")
     sys.exit(1)
 
@@ -507,6 +580,7 @@ if __name__ == "__main__":
     print(f"⏱️  Auto-stop in {MAX_RUNTIME_SECONDS}s.")
     print(f"📄 Today's file: {DAILY_FILE}")
     print(f"📄 Combined file: {COMBINED_FILE}")
+    print(f"📄 Gap log: {GAP_LOG_FILE}")
 
     token = totp_login()
 
@@ -514,6 +588,7 @@ if __name__ == "__main__":
 
     threading.Thread(target=drive_sync_loop,  daemon=True).start()
     threading.Thread(target=runtime_watchdog, daemon=True).start()
+    threading.Thread(target=bar_builder_loop, daemon=True).start()
 
     fyers_ws = data_ws.FyersDataSocket(
         access_token=f"{CLIENT_ID}:{token}",
