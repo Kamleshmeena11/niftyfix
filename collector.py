@@ -175,27 +175,24 @@ def on_message(message):
         _start_new_bar(tick_second, price, vol)
         return
 
-    # If it's the exact same second, update High, Low, and track the Closing candidate
     if tick_second == current_bar_second:
         h        = max(h, price)
         l        = min(l, price)
         c        = price
         last_vol = vol
     else:
-        # 1. Take a clean snapshot of the previous second's OHLC
-        prev_bar_second = current_bar_second
-        prev_o, prev_h, prev_l, prev_c = o, h, l, c
-        
-        # 2. Calculate volume using the previous bar's volume markers BEFORE overwriting them
-        bar_volume = (last_vol - bar_start_vol) if (last_vol is not None and bar_start_vol is not None) else 0
+        # Close out and write the completed bar state
+        bar_volume = (
+            (last_vol - bar_start_vol)
+            if (last_vol is not None and bar_start_vol is not None)
+            else 0
+        )
         if bar_volume < 0:
             bar_volume = 0
-            
-        # 3. Now it is completely safe to overwrite globals for the fresh second
-        _start_new_bar(tick_second, price, vol)
+        _write_bar(current_bar_second, o, h, l, c, bar_volume)
         
-        # 4. Write out the cleanly isolated historical snapshot
-        _write_bar(prev_bar_second, prev_o, prev_h, prev_l, prev_c, bar_volume)
+        # Micro-second shift setup for the incoming live bar frame
+        _start_new_bar(tick_second, price, vol)
 
 
 def on_error(message):
