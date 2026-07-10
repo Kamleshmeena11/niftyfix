@@ -1,9 +1,7 @@
 name: 📈 Nifty 1s Bar Collector
 on:
-  schedule:
-    # 09:10 IST = 03:40 UTC — 5 min buffer before 09:15 market open
-    - cron: "*/5 * * * *"   # fires every 5 min — TEMPORARY, for testing only
   workflow_dispatch:
+
 jobs:
   collect:
     name: Collect Market Data
@@ -12,13 +10,16 @@ jobs:
     steps:
       - name: ⬇️ Checkout
         uses: actions/checkout@v4
+
       - name: 🐍 Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
+
       - name: 📦 Install dependencies
         run: pip install -r requirements.txt
+
       - name: 🚀 Run collector
         env:
           FYERS_APP_ID: ${{ secrets.FYERS_APP_ID }}
@@ -33,6 +34,7 @@ jobs:
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
         run: python collector.py
+
       - name: 📁 Upload daily + combined CSVs as artifact (backup)
         if: always()
         uses: actions/upload-artifact@v4
