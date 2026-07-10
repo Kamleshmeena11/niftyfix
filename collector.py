@@ -140,11 +140,29 @@ tick_queue = queue.Queue()
 # =====================================================================
 # 1-SECOND CANDLE STATE (only touched by the consumer thread now)
 # =====================================================================
-current_bar_second = None
-o = h = l = c = None
-bar_start_vol = None
-last_vol      = None
-last_seen_second = None  # for gap detection across consecutive bars
+# FIX: a real tick for second N can occasionally arrive at our client
+# *after* a tick for second N+1 has already come in (network jitter /
+# reordering inside the feed pipeline — TCP guarantees byte order but
+# not that the exchange-side dispatch/publish order matches our local
+# receive order under load). The old design finalized a bar the
+# instant it saw a tick for the next second, so any such late-but-real
+# tick for N got logged as "late" and silently dropped — creating a
+# gap in our file for a second where Fyers' own data has a real,
+# non-flat price. That's what caused the price mismatch, and flat-
+# filling made it worse by inventing a value instead of leaving it
+# blank.
+#
+# Fix: keep the last few seconds' bars open in `pending_bars` and only
+# write (finalize) a second once we've seen ticks up to LAG_SECONDS
+# past it. A tick landing within that window still updates the
+# correct bar. Only if a second gets no tick at all within the window
+# is it logged as a genuine gap — and even then we do NOT fabricate a
+# row for it, since we have no real data to put there.
+LAG_SECONDS = 2
+
+pending_bars = {}        # second -> [o, h, l, c, start_vol, last_vol]
+max_second_seen = None    # newest second we've received any tick for
+last_written_second = None  # most recent second actually written to disk
 
 
 def _write_bar(second, o_, h_, l_, c_, vol_):
@@ -162,68 +180,68 @@ def _write_bar(second, o_, h_, l_, c_, vol_):
     print(f"🕐 1s Candle: {row.strip()}")
 
 
-def _start_new_bar(second, price, vol):
-    global current_bar_second, o, h, l, c, bar_start_vol, last_vol
-    current_bar_second = second
-    o = h = l = c = price
-    bar_start_vol = vol
-    last_vol      = vol
+def _finalize_second(second):
+    """Pops a completed second out of pending_bars, writes it, and logs
+    (without fabricating data for) any seconds skipped since the last
+    write — those are seconds where no tick ever arrived, even after
+    allowing for the reordering window."""
+    global last_written_second
 
+    if last_written_second is not None and second > last_written_second + 1:
+        missing = second - last_written_second - 1
+        log_gap(f"⚠️  Gap: {missing} second(s) between {last_written_second} "
+                 f"and {second} had no tick even after a {LAG_SECONDS}s "
+                 f"reordering window — left blank (no fabricated price).")
 
-def _flush_current_bar():
-    global current_bar_second, o, h, l, c, bar_start_vol, last_vol
-    if current_bar_second is None:
-        return
-    bar_volume = (
-        (last_vol - bar_start_vol)
-        if (last_vol is not None and bar_start_vol is not None)
-        else 0
-    )
+    o_, h_, l_, c_, start_vol, last_vol = pending_bars.pop(second)
+    bar_volume = (last_vol - start_vol) if (last_vol is not None and start_vol is not None) else 0
     if bar_volume < 0:
         bar_volume = 0
-    _write_bar(current_bar_second, o, h, l, c, bar_volume)
-    current_bar_second = None
+    _write_bar(second, o_, h_, l_, c_, bar_volume)
+    last_written_second = second
+
+
+def _flush_ready():
+    """Finalizes every pending second old enough that no more
+    reordered ticks should arrive for it."""
+    if max_second_seen is None:
+        return
+    cutoff = max_second_seen - LAG_SECONDS
+    for second in sorted(s for s in pending_bars if s <= cutoff):
+        _finalize_second(second)
+
+
+def _flush_all_pending():
+    """Finalizes everything still open, regardless of the lag window —
+    used on disconnect/reconnect and at session end so we don't hold
+    bars in memory across those boundaries."""
+    for second in sorted(pending_bars.keys()):
+        _finalize_second(second)
 
 
 def _process_tick(price, vol, tick_second):
     """Bar-building logic, now run only on the consumer thread."""
-    global o, h, l, c, last_vol, bar_start_vol, current_bar_second, last_seen_second
+    global max_second_seen
 
-    # Gap detection: if the incoming second jumps by more than 1 from
-    # the last one we processed, log it so mismatches can be traced.
-    if last_seen_second is not None and tick_second > last_seen_second + 1:
-        missing = tick_second - last_seen_second - 1
-        log_gap(f"⚠️  Gap detected: {missing} second(s) with no ticks "
-                 f"between {last_seen_second} and {tick_second}.")
-    last_seen_second = tick_second
-
-    if current_bar_second is None:
-        _start_new_bar(tick_second, price, vol)
+    if last_written_second is not None and tick_second <= last_written_second:
+        # Arrived too late even for the reordering window — the bar for
+        # this second has already been written to disk. Can't safely
+        # rewrite a finalized row, so log and drop.
+        log_gap(f"⚠️  Very late tick for second {tick_second} arrived after "
+                 f"that bar was already finalized (last written: "
+                 f"{last_written_second}) — dropped.")
         return
 
-    if tick_second == current_bar_second:
-        h        = max(h, price)
-        l        = min(l, price)
-        c        = price
-        last_vol = vol
-    elif tick_second > current_bar_second:
-        bar_volume = (
-            (last_vol - bar_start_vol)
-            if (last_vol is not None and bar_start_vol is not None)
-            else 0
-        )
-        if bar_volume < 0:
-            bar_volume = 0
-        _write_bar(current_bar_second, o, h, l, c, bar_volume)
-        _start_new_bar(tick_second, price, vol)
+    if tick_second in pending_bars:
+        o_, h_, l_, c_, start_vol, last_vol = pending_bars[tick_second]
+        pending_bars[tick_second] = [o_, max(h_, price), min(l_, price), price, start_vol, vol]
     else:
-        # Out-of-order tick (arrived late, belongs to an already-closed
-        # bar). Previously this was impossible to hit because on_message
-        # only ever compared against "==" vs "else"; a late tick would
-        # have silently reopened a new bar in the past. Now we just log
-        # and drop it rather than corrupt the current bar.
-        log_gap(f"⚠️  Late/out-of-order tick for second {tick_second} "
-                 f"arrived after bar {current_bar_second} was already open — dropped.")
+        pending_bars[tick_second] = [price, price, price, price, vol, vol]
+
+    if max_second_seen is None or tick_second > max_second_seen:
+        max_second_seen = tick_second
+
+    _flush_ready()
 
 
 def bar_builder_loop():
@@ -289,7 +307,7 @@ def runtime_watchdog():
     # Give the consumer thread a moment to drain any queued ticks
     # before we flush, so the final bar isn't missing late-arriving data.
     time.sleep(1)
-    _flush_current_bar()
+    _flush_all_pending()
     try:
         sync_all_to_drive()
     except Exception as e:
