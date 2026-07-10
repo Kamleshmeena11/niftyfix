@@ -323,7 +323,42 @@ def _get_service():
     return _drive_service_cache["service"]
 
 
-def _find_drive_file_id(service, filename, parent_id):
+def _reset_drive_service():
+    """Discards the cached Drive service/connection so the next call
+    builds a brand new one."""
+    _drive_service_cache.clear()
+
+
+def _execute_with_retry(build_request_fn, max_retries=3, what=""):
+    """Runs a single Drive API call (a service.files()....() request)
+    with retries, rebuilding the Drive service from scratch between
+    attempts.
+
+    FIX: googleapiclient/httplib2 can reuse a connection that just
+    finished a resumable upload for the *next* API call. If that
+    connection's read state gets desynced, the next call — even a
+    trivially valid one like `name = 'x.csv' and trashed = false` —
+    comes back as a 400 "malformed request" from Google, even though
+    nothing is wrong with the query itself. This was showing up as an
+    intermittent failure syncing candles_1s_all.csv right after the
+    daily file's resumable upload. Discarding and rebuilding the
+    service on failure forces a fresh connection and reliably clears it.
+    """
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        service = _get_service()
+        try:
+            return build_request_fn(service).execute()
+        except Exception as e:
+            last_err = e
+            label = f" ({what})" if what else ""
+            print(f"⚠️  Drive API call failed{label}, attempt {attempt}/{max_retries}: {e}")
+            _reset_drive_service()
+            time.sleep(1.5 * attempt)
+    raise last_err
+
+
+def _find_drive_file_id(filename, parent_id):
     """Safely builds the Google Drive search string to avoid 400 Bad Requests."""
     query_parts = [f"name = '{filename}'", "trashed = false"]
 
@@ -332,12 +367,16 @@ def _find_drive_file_id(service, filename, parent_id):
         query_parts.append(f"'{str(parent_id).strip()}' in parents")
 
     query = " and ".join(query_parts)
-    results = service.files().list(q=query, spaces="drive", fields="files(id, name)").execute()
+
+    def _req(service):
+        return service.files().list(q=query, spaces="drive", fields="files(id, name)")
+
+    results = _execute_with_retry(_req, what=f"find '{filename}'")
     files = results.get("files", [])
     return files[0]["id"] if files else None
 
 
-def _get_or_create_daily_subfolder(service):
+def _get_or_create_daily_subfolder():
     if "id" in _drive_daily_folder_id_cache:
         return _drive_daily_folder_id_cache["id"]
 
@@ -350,7 +389,11 @@ def _get_or_create_daily_subfolder(service):
         query_parts.append(f"'{str(DRIVE_FOLDER_ID).strip()}' in parents")
 
     query = " and ".join(query_parts)
-    results = service.files().list(q=query, spaces="drive", fields="files(id, name)").execute()
+
+    def _list_req(service):
+        return service.files().list(q=query, spaces="drive", fields="files(id, name)")
+
+    results = _execute_with_retry(_list_req, what="find daily subfolder")
     files = results.get("files", [])
 
     if files:
@@ -362,7 +405,11 @@ def _get_or_create_daily_subfolder(service):
         }
         if DRIVE_FOLDER_ID and str(DRIVE_FOLDER_ID).strip() and str(DRIVE_FOLDER_ID).strip() != "None":
             metadata["parents"] = [str(DRIVE_FOLDER_ID).strip()]
-        folder = service.files().create(body=metadata, fields="id").execute()
+
+        def _create_req(service):
+            return service.files().create(body=metadata, fields="id")
+
+        folder = _execute_with_retry(_create_req, what="create daily subfolder")
         folder_id = folder["id"]
         print(f"📁 Created Drive folder '{DRIVE_DAILY_SUBFOLDER_NAME}'.")
 
@@ -371,24 +418,29 @@ def _get_or_create_daily_subfolder(service):
 
 
 def upload_or_update_drive(local_path, parent_id):
-    service  = _get_service()
     filename = os.path.basename(local_path)
-    media    = MediaFileUpload(local_path, mimetype="text/csv", resumable=True)
-    existing_id = _find_drive_file_id(service, filename, parent_id)
-    if existing_id:
-        service.files().update(fileId=existing_id, media_body=media).execute()
-    else:
+    existing_id = _find_drive_file_id(filename, parent_id)
+
+    def _req(service):
+        # Built fresh inside the retry closure each attempt — a
+        # MediaFileUpload object shouldn't be reused across a failed
+        # and retried request since its internal stream position may
+        # have already advanced.
+        media = MediaFileUpload(local_path, mimetype="text/csv", resumable=True)
+        if existing_id:
+            return service.files().update(fileId=existing_id, media_body=media)
         metadata = {"name": filename}
         if parent_id and str(parent_id).strip() and str(parent_id).strip() != "None":
             metadata["parents"] = [str(parent_id).strip()]
-        service.files().create(body=metadata, media_body=media, fields="id").execute()
+        return service.files().create(body=metadata, media_body=media, fields="id")
+
+    _execute_with_retry(_req, what=f"upload '{filename}'")
     print(f"☁️  Synced '{filename}' → Google Drive.")
 
 
 def sync_all_to_drive():
     global _daily_safe_to_sync, _combined_safe_to_sync
-    service = _get_service()
-    daily_folder_id = _get_or_create_daily_subfolder(service)
+    daily_folder_id = _get_or_create_daily_subfolder()
 
     if _daily_safe_to_sync:
         upload_or_update_drive(DAILY_FILE, daily_folder_id)
@@ -396,7 +448,7 @@ def sync_all_to_drive():
         print("⏸️  Skipping daily-file sync — not yet confirmed safe (retrying bootstrap).")
         try:
             result = _download_from_drive(
-                service, os.path.basename(DAILY_FILE), daily_folder_id, DAILY_FILE
+                os.path.basename(DAILY_FILE), daily_folder_id, DAILY_FILE
             )
             _daily_safe_to_sync = True
             print(f"⬇️  Daily file now confirmed ({result}).")
@@ -409,7 +461,7 @@ def sync_all_to_drive():
         print("⏸️  Skipping combined-file sync — not yet confirmed safe (retrying bootstrap).")
         try:
             result = _download_from_drive(
-                service, os.path.basename(COMBINED_FILE), DRIVE_FOLDER_ID, COMBINED_FILE
+                os.path.basename(COMBINED_FILE), DRIVE_FOLDER_ID, COMBINED_FILE
             )
             _combined_safe_to_sync = True
             print(f"⬇️  Combined file now confirmed ({result}).")
@@ -417,30 +469,44 @@ def sync_all_to_drive():
             print(f"⚠️  Still can't confirm combined file: {e}")
 
 
-def _download_from_drive(service, filename, parent_id, local_path):
-    file_id = _find_drive_file_id(service, filename, parent_id)
+def _download_from_drive(filename, parent_id, local_path):
+    file_id = _find_drive_file_id(filename, parent_id)
     if not file_id:
         return "none_found"
-    request = service.files().get_media(fileId=file_id)
-    buf = io.BytesIO()
-    downloader = MediaIoBaseDownload(buf, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    with open(local_path, "wb") as f:
-        f.write(buf.getvalue())
-    return "downloaded"
+
+    def _do_download():
+        service = _get_service()
+        request = service.files().get_media(fileId=file_id)
+        buf = io.BytesIO()
+        downloader = MediaIoBaseDownload(buf, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        return buf.getvalue()
+
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            data = _do_download()
+            with open(local_path, "wb") as f:
+                f.write(data)
+            return "downloaded"
+        except Exception as e:
+            last_err = e
+            print(f"⚠️  Drive download of '{filename}' failed, attempt {attempt}/3: {e}")
+            _reset_drive_service()
+            time.sleep(1.5 * attempt)
+    raise last_err
 
 
 def bootstrap_local_files():
     global _daily_safe_to_sync, _combined_safe_to_sync
 
     try:
-        service = _get_service()
-        daily_folder_id = _get_or_create_daily_subfolder(service)
+        daily_folder_id = _get_or_create_daily_subfolder()
 
         result = _download_from_drive(
-            service, os.path.basename(DAILY_FILE), daily_folder_id, DAILY_FILE
+            os.path.basename(DAILY_FILE), daily_folder_id, DAILY_FILE
         )
         _daily_safe_to_sync = True
         print(f"⬇️  Daily file: {result} (safe to sync).")
@@ -448,9 +514,8 @@ def bootstrap_local_files():
         print(f"⚠️  Could not verify daily file against Drive yet: {e} — will retry, NOT syncing until confirmed.")
 
     try:
-        service = _get_service()
         result = _download_from_drive(
-            service, os.path.basename(COMBINED_FILE), DRIVE_FOLDER_ID, COMBINED_FILE
+            os.path.basename(COMBINED_FILE), DRIVE_FOLDER_ID, COMBINED_FILE
         )
         _combined_safe_to_sync = True
         print(f"⬇️  Combined file: {result} (safe to sync).")
