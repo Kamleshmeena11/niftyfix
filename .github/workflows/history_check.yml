@@ -1,0 +1,43 @@
+name: 🔍 Fyers 1s History Check
+on:
+  workflow_dispatch:
+
+jobs:
+  history:
+    name: Fetch 1s History
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: ⬇️ Checkout
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: 📦 Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: 🚀 Run history check
+        env:
+          FYERS_APP_ID: ${{ secrets.FYERS_APP_ID }}
+          FYERS_APP_TYPE: ${{ secrets.FYERS_APP_TYPE }}
+          FYERS_SECRET_KEY: ${{ secrets.FYERS_SECRET_KEY }}
+          FYERS_FY_ID: ${{ secrets.FYERS_FY_ID }}
+          FYERS_TOTP_SECRET: ${{ secrets.FYERS_TOTP_SECRET }}
+          FYERS_PIN: ${{ secrets.FYERS_PIN }}
+          FYERS_REDIRECT_URI: ${{ secrets.FYERS_REDIRECT_URI }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+        run: python history_check.py
+
+      - name: 📁 Upload 1s history CSVs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fyers-1s-history-${{ github.run_id }}
+          path: history_1s/*.csv
+          retention-days: 30
