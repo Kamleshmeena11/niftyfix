@@ -3,19 +3,17 @@ import sys
 import time
 import logging
 import asyncio
-import pyotp
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import pandas as pd
 
-# Fyers SDK
+# Fyers SDK (v3) Correct Imports
 from fyers_apiv3 import fyersModel
-from fyers_apiv3.FyersDataSocket import data_ws
+from fyers_apiv3.FyersDataSocket import fyersDataSocket
 
 # Google Drive Modules
-import io
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+from googleapiclient.http import MediaFileUpload
 from google.oauth2.credentials import Credentials
 
 # --- Logging Setup ---
@@ -35,16 +33,12 @@ IST = ZoneInfo("Asia/Kolkata")
 FYERS_APP_ID = os.environ.get("FYERS_APP_ID")
 FYERS_APP_TYPE = os.environ.get("FYERS_APP_TYPE", "100")
 FYERS_SECRET_KEY = os.environ.get("FYERS_SECRET_KEY")
-FYERS_FY_ID = os.environ.get("FYERS_FY_ID")
-FYERS_TOTP_SECRET = os.environ.get("FYERS_TOTP_SECRET")
-FYERS_PIN = os.environ.get("FYERS_PIN")
-FYERS_REDIRECT_URI = os.environ.get("FYERS_REDIRECT_URI", "https://trade.fyers.in/api-login/default-redirect-uri/index.php")
+FYERS_ACCESS_TOKEN = os.environ.get("FYERS_ACCESS_TOKEN")
 
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
 GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN")
 
-# Instruments mapping for Fyers API v3
 INSTRUMENTS = {
     "NSE:NIFTY50-INDEX": {"label": "nifty"},
     "NSE:NIFTYBANK-INDEX": {"label": "bank_nifty"},
@@ -81,7 +75,6 @@ def write_bar(instrument_key: str, bar_time: datetime, ticks: list):
     label = INSTRUMENTS[instrument_key]["label"]
     bar_str = bar_time.strftime("%Y-%m-%d %H:%M:%S")
     date_str = bar_time.strftime("%Y-%m-%d")
-    tick_count = len(ticks)
     prices = [t["price"] for t in ticks]
     volumes = [t.get("volume", 0) for t in ticks]
 
@@ -97,7 +90,7 @@ def write_bar(instrument_key: str, bar_time: datetime, ticks: list):
 
     append_row_to_csv(get_daily_path(label, date_str), new_row)
     append_row_to_csv(get_combined_path(label), new_row)
-    logger.info(f"[{label}] Saved 1s Bar -> {bar_str} IST | Close: {new_row['close']} | Ticks: {tick_count}")
+    logger.info(f"[{label}] Saved 1s Bar -> {bar_str} IST | Close: {new_row['close']} | Ticks: {len(ticks)}")
 
 
 def flush_ready_buckets():
@@ -175,23 +168,7 @@ def upload_file_to_drive(local_path: str, drive_filename: str):
         logger.error(f"Google Drive Upload Error ({drive_filename}): {e}")
 
 
-# --- Fyers Authentication ---
-def get_fyers_access_token():
-    logger.info("Generating Fyers access token via TOTP...")
-    app_id_full = f"{FYERS_APP_ID}-{FYERS_APP_TYPE}"
-    
-    session = fyersModel.SessionModel(
-        client_id=app_id_full,
-        secret_key=FYERS_SECRET_KEY,
-        redirect_uri=FYERS_REDIRECT_URI,
-        response_type="code",
-        grant_type="authorization_code"
-    )
-    login_response = session.generate_authcode()
-    return os.environ.get("FYERS_ACCESS_TOKEN", login_response)
-
-
-# --- Fyers WebSocket Streamer ---
+# --- Fyers WebSocket Streamer Callbacks ---
 def on_message(message):
     try:
         symbol = message.get("symbol")
@@ -241,11 +218,10 @@ async def google_drive_sync_loop():
 
 async def main():
     os.makedirs(BASE_DATA_DIR, exist_ok=True)
-    access_token = os.environ.get("FYERS_ACCESS_TOKEN") or get_fyers_access_token()
     app_id_full = f"{FYERS_APP_ID}-{FYERS_APP_TYPE}"
 
-    fyers_ws = data_ws.FyersDataSocket(
-        access_token=f"{app_id_full}:{access_token}",
+    fyers_ws = fyersDataSocket.FyersDataSocket(
+        access_token=f"{app_id_full}:{FYERS_ACCESS_TOKEN}",
         log_path="",
         lStream=True,
         on_connect=lambda: on_open(fyers_ws),
