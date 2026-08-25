@@ -117,7 +117,6 @@ def flush_ready_buckets():
 
         for epoch_sec in range(last_flushed_epoch[instrument_key] + 1, cutoff + 1):
             bar_time = datetime.fromtimestamp(epoch_sec, tz=IST)
-            bar_str = bar_time.strftime("%Y-%m-%d %H:%M:%S")
             ticks = tick_buckets[instrument_key].pop(epoch_sec, None)
             if not ticks:
                 continue
@@ -188,13 +187,7 @@ def get_fyers_access_token():
         response_type="code",
         grant_type="authorization_code"
     )
-    
-    totp = pyotp.TOTP(FYERS_TOTP_SECRET).now()
-    
-    # Auto-login step (requires valid credentials)
     login_response = session.generate_authcode()
-    # Note: If automatic auth-code generation is configured on your Fyers app,
-    # supply access token directly via FYERS_ACCESS_TOKEN or run local token generation.
     return os.environ.get("FYERS_ACCESS_TOKEN", login_response)
 
 
