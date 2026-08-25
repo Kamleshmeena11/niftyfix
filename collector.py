@@ -9,7 +9,7 @@ import pandas as pd
 
 # Fyers SDK (v3) Correct Imports
 from fyers_apiv3 import fyersModel
-from fyers_apiv3.FyersDataSocket import fyersDataSocket
+from fyers_apiv3.FyersWebsocket import data_ws
 
 # Google Drive Modules
 from googleapiclient.discovery import build
@@ -220,16 +220,18 @@ async def main():
     os.makedirs(BASE_DATA_DIR, exist_ok=True)
     app_id_full = f"{FYERS_APP_ID}-{FYERS_APP_TYPE}"
 
-    fyers_ws = fyersDataSocket.FyersDataSocket(
+    fyers_ws = data_ws.FyersDataSocket(
         access_token=f"{app_id_full}:{FYERS_ACCESS_TOKEN}",
         log_path="",
-        lStream=True,
+        litemode=False,
+        write_to_file=False,
+        reconnect=True,
         on_connect=lambda: on_open(fyers_ws),
         on_close=on_close,
         on_error=on_error,
         on_message=on_message
     )
-    
+
     fyers_ws.connect()
 
     logger.info("Starting real-time data loops...")
