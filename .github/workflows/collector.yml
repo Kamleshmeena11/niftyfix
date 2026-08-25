@@ -1,4 +1,5 @@
-name: 📈 Nifty 1s Bar Collector
+name: 📈 Nifty 1s Bar Collector (Fyers)
+
 on:
   workflow_dispatch:
 
@@ -7,6 +8,7 @@ jobs:
     name: Collect Market Data
     runs-on: ubuntu-latest
     timeout-minutes: 375
+
     steps:
       - name: ⬇️ Checkout
         uses: actions/checkout@v4
@@ -29,10 +31,10 @@ jobs:
           FYERS_TOTP_SECRET: ${{ secrets.FYERS_TOTP_SECRET }}
           FYERS_PIN: ${{ secrets.FYERS_PIN }}
           FYERS_REDIRECT_URI: ${{ secrets.FYERS_REDIRECT_URI }}
+          FYERS_ACCESS_TOKEN: ${{ secrets.FYERS_ACCESS_TOKEN }}
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
-          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
         run: python collector.py
 
       - name: 📁 Upload daily + combined CSVs as artifact (backup)
@@ -41,6 +43,6 @@ jobs:
         with:
           name: nifty-bars-${{ github.run_id }}
           path: |
-            daily_bars/*.csv
-            candles_1s_all.csv
+            data/**/*.csv
+            data/*.csv
           retention-days: 30
