@@ -77,13 +77,13 @@ TOKEN_CACHE_PATH = "fyers_token_cache.json"
 # --- Instrument (single symbol, Level 1 + Level 2) ---
 FYERS_SYMBOL = os.environ.get("FYERS_SYMBOL", "NSE:TCS-EQ")
 INSTRUMENT_LABEL = "tcs"
-# NOTE ON DEPTH: Fyers' standard "DepthUpdate" websocket feed (subscribed to
-# below) only ever sends 5 levels per side, regardless of this setting --
-# it is a limit of that feed/subscription tier, not of this script. Fyers
-# does offer a separate higher-tier "TBT" (Tick-By-Tick) feed with up to 50
-# levels, but that requires a different subscription/integration entirely
-# and is NOT what data_ws's DepthUpdate provides.
-DOM_LEVELS = int(os.environ.get("FYERS_DOM_LEVELS", "5"))
+# NOTE ON DEPTH: how many levels/side you actually receive from Fyers'
+# "DepthUpdate" feed depends on the instrument/segment and your Fyers plan
+# -- some feeds send back more than the old 5-level assumption. This script
+# just requests/accepts up to DOM_LEVELS per side; extract_depth_levels()
+# slices to that cap, so if Fyers sends fewer levels for a given symbol you
+# simply get fewer, and if it sends more you now capture up to 50.
+DOM_LEVELS = int(os.environ.get("FYERS_DOM_LEVELS", "50"))
 
 # Optional: split each trade print into N separate 1-volume lines, matching
 # the C# indicator's "Split multi-lot prints into 1-lot lines (matches NT8
