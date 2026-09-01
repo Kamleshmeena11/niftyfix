@@ -547,8 +547,10 @@ def handle_trade_message(message: dict):
     # so lines stay orderable (see module-level NOTE above).
     recv_micros = datetime.now(IST).microsecond
     timestamp_str = format_l1_timestamp(trade_dt, micros_override=recv_micros)
-    bid_str = fmt_num(best_bid) if best_bid is not None else "0"
-    ask_str = fmt_num(best_ask) if best_ask is not None else "0"
+    # Matches the C# source: if no bid/ask quote has arrived yet, fall back
+    # to the trade price itself rather than writing "0".
+    bid_str = fmt_num(best_bid) if best_bid is not None else fmt_num(ltp)
+    ask_str = fmt_num(best_ask) if best_ask is not None else fmt_num(ltp)
 
     if FYERS_SPLIT_PRINTS:
         # Matches the C# script's SplitPrints: emit `lots` separate rows,
