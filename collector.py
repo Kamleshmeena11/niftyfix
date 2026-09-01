@@ -32,8 +32,32 @@ logger = logging.getLogger(__name__)
 IST = ZoneInfo("Asia/Kolkata")
 
 # --- Fyers app credentials (from your Fyers API app) ---
-FYERS_APP_ID = os.environ.get("FYERS_APP_ID")
-FYERS_APP_TYPE = os.environ.get("FYERS_APP_TYPE", "100")
+def _normalize_app_id(raw: str, app_type: str) -> str:
+    """
+    Accepts either the bare app id ('XY0W1234') or the full client-id
+    format ('XY0W1234-100') for FYERS_APP_ID and always returns the bare
+    app id — the '-<app_type>' suffix is appended back on wherever a full
+    client_id is actually needed. Makes the script work regardless of
+    which format was pasted into the secret.
+    """
+    if not raw:
+        return raw
+    raw = raw.strip()
+    suffix = f"-{app_type}"
+    if raw.endswith(suffix):
+        return raw[: -len(suffix)]
+    # Also handle a stray "-<anything>" suffix in case FYERS_APP_TYPE
+    # itself doesn't match what's embedded in the id.
+    if "-" in raw:
+        head, _, tail = raw.rpartition("-")
+        if tail.isdigit():
+            return head
+    return raw
+
+
+_RAW_APP_TYPE = os.environ.get("FYERS_APP_TYPE", "100")
+FYERS_APP_ID = _normalize_app_id(os.environ.get("FYERS_APP_ID"), _RAW_APP_TYPE)
+FYERS_APP_TYPE = _RAW_APP_TYPE
 FYERS_SECRET_KEY = os.environ.get("FYERS_SECRET_KEY")
 FYERS_REDIRECT_URI = os.environ.get("FYERS_REDIRECT_URI")
 
@@ -120,18 +144,10 @@ def generate_access_token_via_totp() -> str:
         return f"{v[:2]}***{v[-2:]} (len={len(v)})"
 
     logger.info(
-        f"Using FYERS_APP_ID={_mask(FYERS_APP_ID)} "
+        f"Using FYERS_APP_ID={_mask(FYERS_APP_ID)} (normalized, bare app id) "
         f"FYERS_APP_TYPE={FYERS_APP_TYPE!r} "
         f"FYERS_REDIRECT_URI={FYERS_REDIRECT_URI!r}"
     )
-    if FYERS_APP_ID != FYERS_APP_ID.strip():
-        logger.warning("FYERS_APP_ID has leading/trailing whitespace — this will break auth.")
-    if "-" in FYERS_APP_ID:
-        logger.warning(
-            f"FYERS_APP_ID contains a '-' ({_mask(FYERS_APP_ID)}) — it should be ONLY the "
-            "app id, e.g. 'XY0W1234', NOT 'XY0W1234-100'. The '-100' app type suffix is "
-            "appended separately by this script."
-        )
 
     session = requests.Session()
     base = "https://api-t2.fyers.in/vagator/v2"
