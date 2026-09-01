@@ -80,7 +80,12 @@ INSTRUMENT_LABEL = "tcs"
 DOM_LEVELS = int(os.environ.get("FYERS_DOM_LEVELS", "5"))
 
 BASE_DATA_DIR = "data"
-DAILY_DIR = os.path.join(BASE_DATA_DIR, "daily")
+
+# Local + Drive layout: ONE folder per instrument (e.g. "tcs"), containing
+# exactly two running files — RawData.csv (L1 tape) and Level2.csv (L2 DOM
+# diffs). No daily sub-folders, no duplicate daily/combined pairs.
+RAW_DATA_FILENAME = "RawData.csv"
+LEVEL2_FILENAME = "Level2.csv"
 
 
 # =========================================================
@@ -273,10 +278,11 @@ def get_valid_access_token() -> str:
 #
 # CHANGED FROM THE C# SOURCE: the C# indicator interleaves L1 and L2 lines
 # into ONE local file (see its header comment). This collector instead
-# writes them to TWO SEPARATE files/Drive uploads — one for the L1 tape,
-# one for the L2 DOM diffs — while keeping the exact same per-line wire
-# format for each line type, so a downstream tool can still parse either
-# file the same way it would parse a filtered slice of the combined one.
+# writes them to TWO SEPARATE, ever-growing files — one for the L1 tape,
+# one for the L2 DOM diffs — both living inside a single per-instrument
+# folder (e.g. "tcs/"), while keeping the exact same per-line wire format
+# for each line type. No daily rotation, no duplicate daily+combined
+# copies — just RawData.csv and Level2.csv, appended to forever.
 #
 # NOTE ON TIMESTAMP PRECISION: Fyers' feed only gives trade time (ltt) to
 # 1-second resolution and doesn't expose exchange-side microseconds the way
@@ -284,20 +290,12 @@ def get_valid_access_token() -> str:
 # receipt-time microseconds so lines stay strictly orderable, but it is
 # NOT the exchange's true tick timestamp the way the C# source is.
 
-def get_l1_daily_path(label: str, date_str: str) -> str:
-    return os.path.join(DAILY_DIR, date_str, f"{label}_L1_{date_str}.csv")
+def get_raw_data_path(label: str) -> str:
+    return os.path.join(BASE_DATA_DIR, label, RAW_DATA_FILENAME)
 
 
-def get_l1_combined_path(label: str) -> str:
-    return os.path.join(BASE_DATA_DIR, f"{label}_L1_ALL.csv")
-
-
-def get_l2_daily_path(label: str, date_str: str) -> str:
-    return os.path.join(DAILY_DIR, date_str, f"{label}_L2_{date_str}.csv")
-
-
-def get_l2_combined_path(label: str) -> str:
-    return os.path.join(BASE_DATA_DIR, f"{label}_L2_ALL.csv")
+def get_level2_path(label: str) -> str:
+    return os.path.join(BASE_DATA_DIR, label, LEVEL2_FILENAME)
 
 
 def append_pipe_line(path: str, line: str):
@@ -307,20 +305,13 @@ def append_pipe_line(path: str, line: str):
 
 
 def write_l1_line(label: str, line: str):
-    """Writes one 'L1;' tape line to today's daily L1 file and the running
-    combined L1 file. Kept separate from L2 so the two data types never
-    share a file or a Drive upload."""
-    today_str = datetime.now(IST).strftime("%Y-%m-%d")
-    append_pipe_line(get_l1_daily_path(label, today_str), line)
-    append_pipe_line(get_l1_combined_path(label), line)
+    """Appends one 'L1;' tape line to <label>/RawData.csv."""
+    append_pipe_line(get_raw_data_path(label), line)
 
 
 def write_l2_line(label: str, line: str):
-    """Writes one 'L2;' DOM-diff line to today's daily L2 file and the
-    running combined L2 file."""
-    today_str = datetime.now(IST).strftime("%Y-%m-%d")
-    append_pipe_line(get_l2_daily_path(label, today_str), line)
-    append_pipe_line(get_l2_combined_path(label), line)
+    """Appends one 'L2;' DOM-diff line to <label>/Level2.csv."""
+    append_pipe_line(get_level2_path(label), line)
 
 
 def fmt_num(x) -> str:
@@ -601,14 +592,14 @@ def get_or_create_drive_folder(service, name: str, parent_id: str = None) -> str
     return folder["id"]
 
 
-def upload_file_to_drive(local_path: str, drive_filename: str):
+def upload_file_to_drive(local_path: str, drive_filename: str, folder_name: str):
+    """Uploads/updates a single file inside ONE Drive folder named
+    `folder_name` (e.g. "tcs") sitting at Drive root — no date subfolders."""
     if not os.path.exists(local_path) or not all([GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN]):
         return
     try:
         service = _get_drive_service()
-        daily_folder_id = get_or_create_drive_folder(service, "daily")
-        today_str = datetime.now(IST).strftime("%Y-%m-%d")
-        parent_id = get_or_create_drive_folder(service, today_str, parent_id=daily_folder_id)
+        parent_id = get_or_create_drive_folder(service, folder_name)
 
         query = f"name = '{drive_filename}' and trashed = false and '{parent_id}' in parents"
         results = service.files().list(q=query, fields="files(id)").execute()
@@ -624,22 +615,17 @@ def upload_file_to_drive(local_path: str, drive_filename: str):
 
 
 async def google_drive_sync_loop():
-    """Syncs four files per cycle: today's L1 file + the running combined
-    L1 file, and today's L2 file + the running combined L2 file — kept
-    fully separate from each other, both locally and on Drive."""
+    """Syncs exactly two files per cycle, both inside the same Drive folder
+    named after the instrument (e.g. "tcs/RawData.csv" and
+    "tcs/Level2.csv")."""
     while True:
         await asyncio.sleep(10)
-        today_str = datetime.now(IST).strftime("%Y-%m-%d")
 
-        l1_daily_path = get_l1_daily_path(INSTRUMENT_LABEL, today_str)
-        await asyncio.to_thread(upload_file_to_drive, l1_daily_path, os.path.basename(l1_daily_path))
-        l1_combined_path = get_l1_combined_path(INSTRUMENT_LABEL)
-        await asyncio.to_thread(upload_file_to_drive, l1_combined_path, os.path.basename(l1_combined_path))
+        raw_path = get_raw_data_path(INSTRUMENT_LABEL)
+        await asyncio.to_thread(upload_file_to_drive, raw_path, RAW_DATA_FILENAME, INSTRUMENT_LABEL)
 
-        l2_daily_path = get_l2_daily_path(INSTRUMENT_LABEL, today_str)
-        await asyncio.to_thread(upload_file_to_drive, l2_daily_path, os.path.basename(l2_daily_path))
-        l2_combined_path = get_l2_combined_path(INSTRUMENT_LABEL)
-        await asyncio.to_thread(upload_file_to_drive, l2_combined_path, os.path.basename(l2_combined_path))
+        level2_path = get_level2_path(INSTRUMENT_LABEL)
+        await asyncio.to_thread(upload_file_to_drive, level2_path, LEVEL2_FILENAME, INSTRUMENT_LABEL)
 
 
 async def run_websocket_with_retry():
