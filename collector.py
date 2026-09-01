@@ -7,7 +7,6 @@ import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-import pandas as pd
 import requests
 import pyotp
 
@@ -75,17 +74,13 @@ GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN")
 
 TOKEN_CACHE_PATH = "fyers_token_cache.json"
 
-INSTRUMENTS = {
-    "NSE:NIFTY50-INDEX": {"label": "nifty"},
-    "NSE:NIFTYBANK-INDEX": {"label": "bank_nifty"},
-}
+# --- Instrument (single symbol, Level 1 + Level 2) ---
+FYERS_SYMBOL = os.environ.get("FYERS_SYMBOL", "NSE:TCS-EQ")
+INSTRUMENT_LABEL = "tcs"
+DOM_LEVELS = int(os.environ.get("FYERS_DOM_LEVELS", "5"))
 
 BASE_DATA_DIR = "data"
 DAILY_DIR = os.path.join(BASE_DATA_DIR, "daily")
-
-tick_buckets = {key: {} for key in INSTRUMENTS}
-BUFFER_SECONDS = 2
-last_flushed_epoch = {key: None for key in INSTRUMENTS}
 
 
 # =========================================================
@@ -265,68 +260,289 @@ def get_valid_access_token() -> str:
     logger.info("No valid token found — generating a new one automatically.")
     return generate_access_token_via_totp()
 
+# =========================================================
+# --- L1/L2 pipe-format output (matches UltraLinkQuantowerBridge_GDrive.cs) ---
+# =========================================================
+#
+#   L1 line:  L1;{side};{yyyyMMddHHmmss};{ffffff};{price};{size}
+#   L2 line:  L2;{side};{yyyyMMddHHmmss};{ffffff};{op};{level};;{price};{size}
+#
+#   side  : 0 = ask/offer side, 1 = bid side
+#   op    : 0 = level inserted/changed, 2 = level dropped (size forced to 0)
+#   level : 0-based depth index on that side, 0 = best price
+#
+# NOTE ON TIMESTAMP PRECISION: Fyers' feed only gives trade time (ltt) to
+# 1-second resolution and doesn't expose exchange-side microseconds the way
+# the raw NT8 tape does. The {ffffff} field here is filled from local
+# receipt-time microseconds so lines stay strictly orderable, but it is
+# NOT the exchange's true tick timestamp the way the C# source is.
 
-# --- Bar writing helpers ---
-def get_daily_path(label: str, date_str: str) -> str:
-    return os.path.join(DAILY_DIR, date_str, f"{label}_{date_str}.csv")
+def get_l1l2_daily_path(label: str, date_str: str) -> str:
+    return os.path.join(DAILY_DIR, date_str, f"{label}_L1L2_{date_str}.csv")
 
 
-def get_combined_path(label: str) -> str:
-    return os.path.join(BASE_DATA_DIR, f"{label}_ALL.csv")
+def get_l1l2_combined_path(label: str) -> str:
+    return os.path.join(BASE_DATA_DIR, f"{label}_L1L2_ALL.csv")
 
 
-def append_row_to_csv(path: str, row: dict):
+def append_pipe_line(path: str, line: str):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    df = pd.DataFrame([row])
-    file_exists = os.path.isfile(path)
-    df.to_csv(path, mode="a", index=False, header=not file_exists)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
 
 
-def write_bar(instrument_key: str, bar_time: datetime, ticks: list):
-    label = INSTRUMENTS[instrument_key]["label"]
-    bar_str = bar_time.strftime("%Y-%m-%d %H:%M:%S")
-    date_str = bar_time.strftime("%Y-%m-%d")
-    prices = [t["price"] for t in ticks]
-    volumes = [t.get("volume", 0) for t in ticks]
+def write_l1l2_line(label: str, line: str):
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    append_pipe_line(get_l1l2_daily_path(label, today_str), line)
+    append_pipe_line(get_l1l2_combined_path(label), line)
 
-    new_row = {
-        "timestamp": bar_str,
-        "instrument_key": instrument_key,
-        "open": prices[0],
-        "high": max(prices),
-        "low": min(prices),
-        "close": prices[-1],
-        "volume": sum(volumes)
+
+def fmt_num(x) -> str:
+    """Match C#'s double.ToString(InvariantCulture): plain decimal, no
+    trailing '.0' for whole numbers, no scientific notation."""
+    if x is None:
+        return "0"
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return str(x)
+    if f.is_integer():
+        return str(int(f))
+    s = f"{f:.6f}".rstrip("0").rstrip(".")
+    return s if s else "0"
+
+
+def format_nt8_timestamp(dt: datetime, micros_override: int = None):
+    """Returns (datePart, fracPart) as 'yyyyMMddHHmmss' and 6-digit
+    microseconds, matching FormatNt8Timestamp() in the C# source."""
+    date_part = dt.strftime("%Y%m%d%H%M%S")
+    micros = micros_override if micros_override is not None else dt.microsecond
+    frac_part = f"{micros:06d}"
+    return date_part, frac_part
+
+
+# --- Per-instrument state (single symbol here, but keyed for extensibility) ---
+_state = {
+    FYERS_SYMBOL: {
+        "last_cum_volume": None,
+        "last_l1_side": 0,
+        "best_bid": None,
+        "best_ask": None,
+        "last_ask_levels": [],  # list[(price, size)], index 0 = best
+        "last_bid_levels": [],
+        "logged_unrecognized_depth": False,
     }
-
-    append_row_to_csv(get_daily_path(label, date_str), new_row)
-    append_row_to_csv(get_combined_path(label), new_row)
-    logger.info(f"[{label}] Saved 1s Bar -> {bar_str} IST | Close: {new_row['close']} | Ticks: {len(ticks)}")
+}
 
 
-def flush_ready_buckets():
-    global tick_buckets, last_flushed_epoch
+def extract_depth_levels(message: dict, max_levels: int):
+    """
+    Flexible extraction to cope with Fyers' undocumented DepthUpdate schema.
+    Tries, in order:
+      1. Nested list-of-dict shape confirmed from Fyers' REST depth() API:
+         message['ask' or 'asks'] / message['bid' or 'bids'], each a list of
+         {'price': ..., 'volume': ...} (or 'qty'/'size').
+      2. Flat numbered keys: ask_price{i}/ask_size{i}(or ask_qty{i}),
+         bid_price{i}/bid_size{i}(or bid_qty{i}) for i in 1..max_levels.
+    Returns (asks, bids) as lists of (price, size) tuples, best price first,
+    or (None, None) if neither shape matches.
+    """
+    ask_raw = message.get("ask") if isinstance(message.get("ask"), list) else message.get("asks")
+    bid_raw = message.get("bid") if isinstance(message.get("bid"), list) else message.get("bids")
 
-    now_epoch = int(time.time())
-    cutoff = now_epoch - BUFFER_SECONDS
+    if isinstance(ask_raw, list) and isinstance(bid_raw, list) and (ask_raw or bid_raw):
+        def conv(levels):
+            out = []
+            for lvl in levels[:max_levels]:
+                if not isinstance(lvl, dict):
+                    continue
+                price = lvl.get("price")
+                size = lvl.get("volume", lvl.get("qty", lvl.get("size")))
+                if price is None or size is None:
+                    continue
+                try:
+                    out.append((float(price), float(size)))
+                except (TypeError, ValueError):
+                    continue
+            return out
+        return conv(ask_raw), conv(bid_raw)
 
-    for instrument_key, label_info in INSTRUMENTS.items():
-        label = label_info["label"]
+    asks, bids = [], []
+    for i in range(1, max_levels + 1):
+        ap = message.get(f"ask_price{i}")
+        asz = message.get(f"ask_size{i}", message.get(f"ask_qty{i}"))
+        bp = message.get(f"bid_price{i}")
+        bsz = message.get(f"bid_size{i}", message.get(f"bid_qty{i}"))
+        if ap is not None and asz is not None:
+            try:
+                asks.append((float(ap), float(asz)))
+            except (TypeError, ValueError):
+                pass
+        if bp is not None and bsz is not None:
+            try:
+                bids.append((float(bp), float(bsz)))
+            except (TypeError, ValueError):
+                pass
 
-        if last_flushed_epoch[instrument_key] is None:
-            now_str = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
-            logger.warning(f"[{label}] Bucket tracking initialized at {now_str} IST.")
-            last_flushed_epoch[instrument_key] = cutoff - 1
-            continue
+    if asks or bids:
+        return asks, bids
 
-        for epoch_sec in range(last_flushed_epoch[instrument_key] + 1, cutoff + 1):
-            bar_time = datetime.fromtimestamp(epoch_sec, tz=IST)
-            ticks = tick_buckets[instrument_key].pop(epoch_sec, None)
-            if not ticks:
-                continue
-            write_bar(instrument_key, bar_time, ticks)
+    return None, None
 
-        last_flushed_epoch[instrument_key] = cutoff
+
+def diff_dom_side(side: int, current: list, previous: list, date_part: str, frac_part: str) -> list:
+    """Mirrors DiffDomSide() in the C# source: emits a line for every level
+    that changed price/size (op=0) or dropped out of the book (op=2, size
+    forced to 0). Only emits for levels that actually changed."""
+    out_lines = []
+    max_len = max(len(current), len(previous))
+    for level in range(max_len):
+        has_cur = level < len(current)
+        has_prev = level < len(previous)
+
+        if has_cur and (not has_prev or previous[level] != current[level]):
+            price, size = current[level]
+            out_lines.append(f"L2;{side};{date_part};{frac_part};0;{level};;{fmt_num(price)};{fmt_num(size)}")
+        elif not has_cur and has_prev:
+            price, _ = previous[level]
+            out_lines.append(f"L2;{side};{date_part};{frac_part};2;{level};;{fmt_num(price)};0")
+
+    return out_lines
+
+
+def handle_trade_message(message: dict):
+    """Handles a SymbolUpdate (trade/quote) message -> emits an 'L1;' line
+    for each new trade. Per-trade size is derived from the delta in Fyers'
+    cumulative 'vol_traded_today' field (Fyers doesn't reliably expose a
+    per-tick 'ltq' on this feed in all cases)."""
+    symbol = message.get("symbol")
+    state = _state.get(symbol)
+    if state is None:
+        return
+
+    ltp = message.get("ltp")
+    if ltp is None:
+        return
+
+    cum_vol = message.get("vol_traded_today")
+    if cum_vol is None:
+        return
+    try:
+        cum_vol = float(cum_vol)
+    except (TypeError, ValueError):
+        return
+
+    prev_cum = state["last_cum_volume"]
+    state["last_cum_volume"] = cum_vol
+    if prev_cum is None:
+        return  # first message just establishes the baseline
+    size = cum_vol - prev_cum
+    if size <= 0:
+        return  # no new trade since the last message
+
+    best_ask = state["best_ask"]
+    best_bid = state["best_bid"]
+    if best_ask is not None and ltp >= best_ask:
+        side = 0
+    elif best_bid is not None and ltp <= best_bid:
+        side = 1
+    else:
+        side = state["last_l1_side"]
+    state["last_l1_side"] = side
+
+    ltt = message.get("ltt")
+    try:
+        trade_dt = datetime.fromtimestamp(int(ltt), tz=IST) if ltt else datetime.now(IST)
+    except (TypeError, ValueError, OSError):
+        trade_dt = datetime.now(IST)
+
+    # ltt only has 1-second resolution; use current receipt-time microseconds
+    # so lines stay orderable (see module-level NOTE above).
+    recv_micros = datetime.now(IST).microsecond
+    date_part, frac_part = format_nt8_timestamp(trade_dt, micros_override=recv_micros)
+
+    line = f"L1;{side};{date_part};{frac_part};{fmt_num(ltp)};{fmt_num(size)}"
+    write_l1l2_line(INSTRUMENT_LABEL, line)
+
+
+def handle_depth_message(message: dict):
+    """Handles a DepthUpdate message -> diffs against the previous snapshot
+    and emits 'L2;' lines only for levels that actually changed."""
+    symbol = message.get("symbol")
+    state = _state.get(symbol)
+    if state is None:
+        return
+
+    asks, bids = extract_depth_levels(message, DOM_LEVELS)
+    if asks is None and bids is None:
+        if not state["logged_unrecognized_depth"]:
+            state["logged_unrecognized_depth"] = True
+            logger.warning(
+                f"Unrecognized DepthUpdate schema for {symbol} — no known "
+                f"bid/ask fields found. Raw message: {message}"
+            )
+        return
+
+    asks = asks or []
+    bids = bids or []
+    if asks:
+        state["best_ask"] = asks[0][0]
+    if bids:
+        state["best_bid"] = bids[0][0]
+
+    now = datetime.now(IST)
+    date_part, frac_part = format_nt8_timestamp(now)
+
+    lines = diff_dom_side(0, asks, state["last_ask_levels"], date_part, frac_part)
+    lines += diff_dom_side(1, bids, state["last_bid_levels"], date_part, frac_part)
+
+    state["last_ask_levels"] = asks
+    state["last_bid_levels"] = bids
+
+    for line in lines:
+        write_l1l2_line(INSTRUMENT_LABEL, line)
+
+
+# --- Fyers WebSocket callbacks ---
+def on_message(message):
+    try:
+        if not isinstance(message, dict):
+            return
+        # Route by shape rather than relying on an undocumented "type" key:
+        # a depth-ish message carries book fields; a trade/quote message
+        # carries 'ltp'. Depth is checked first since some feeds echo ltp
+        # on depth snapshots too.
+        looks_like_depth = any(
+            k in message for k in ("ask", "asks", "bid", "bids", "ask_price1", "bid_price1")
+        )
+        if looks_like_depth:
+            handle_depth_message(message)
+        elif "ltp" in message:
+            handle_trade_message(message)
+    except Exception as e:
+        logger.error(f"Error parsing feed message: {e}")
+
+
+def on_error(message):
+    logger.error(f"Fyers WebSocket Error: {message}")
+    if isinstance(message, dict) and message.get("code") == -300:
+        logger.warning("Token rejected by server — clearing cache for regeneration.")
+        try:
+            if os.path.isfile(TOKEN_CACHE_PATH):
+                os.remove(TOKEN_CACHE_PATH)
+        except Exception:
+            pass
+
+
+def on_close(message):
+    logger.info(f"Fyers WebSocket Connection Closed: {message}")
+
+
+def on_open(fyers_socket):
+    logger.info(f"Connected to Fyers Data Socket. Subscribing to {FYERS_SYMBOL} (L1 + L2)...")
+    fyers_socket.subscribe(symbols=[FYERS_SYMBOL], data_type="SymbolUpdate")
+    fyers_socket.subscribe(symbols=[FYERS_SYMBOL], data_type="DepthUpdate")
+    fyers_socket.keep_running()
 
 
 # --- Google Drive helpers ---
@@ -379,61 +595,14 @@ def upload_file_to_drive(local_path: str, drive_filename: str):
         logger.error(f"Google Drive Upload Error ({drive_filename}): {e}")
 
 
-# --- Fyers WebSocket callbacks ---
-def on_message(message):
-    try:
-        symbol = message.get("symbol")
-        ltp = message.get("ltp")
-        if symbol in tick_buckets and ltp is not None:
-            ltt = message.get("ltt", int(time.time()))
-            tick_epoch_sec = int(ltt)
-            tick_buckets[symbol].setdefault(tick_epoch_sec, []).append({
-                "price": float(ltp),
-                "volume": float(message.get("vol_traded_today", 0))
-            })
-    except Exception as e:
-        logger.error(f"Error parsing feed message: {e}")
-
-
-def on_error(message):
-    logger.error(f"Fyers WebSocket Error: {message}")
-    # If the token itself is rejected mid-stream, wipe the cache so the
-    # next connection attempt is forced to regenerate a fresh one.
-    if isinstance(message, dict) and message.get("code") == -300:
-        logger.warning("Token rejected by server — clearing cache for regeneration.")
-        try:
-            if os.path.isfile(TOKEN_CACHE_PATH):
-                os.remove(TOKEN_CACHE_PATH)
-        except Exception:
-            pass
-
-
-def on_close(message):
-    logger.info(f"Fyers WebSocket Connection Closed: {message}")
-
-
-def on_open(fyers_socket):
-    logger.info("Connected to Fyers Data Socket. Subscribing to symbols...")
-    symbols = list(INSTRUMENTS.keys())
-    fyers_socket.subscribe(symbols=symbols, data_type="SymbolUpdate")
-    fyers_socket.keep_running()
-
-
-async def seconds_timer_loop():
-    while True:
-        now = time.time()
-        await asyncio.sleep(1.0 - (now % 1.0))
-        flush_ready_buckets()
-
-
 async def google_drive_sync_loop():
     while True:
         await asyncio.sleep(10)
         today_str = datetime.now(IST).strftime("%Y-%m-%d")
-        for info in INSTRUMENTS.values():
-            label = info["label"]
-            daily_path = get_daily_path(label, today_str)
-            await asyncio.to_thread(upload_file_to_drive, daily_path, os.path.basename(daily_path))
+        daily_path = get_l1l2_daily_path(INSTRUMENT_LABEL, today_str)
+        await asyncio.to_thread(upload_file_to_drive, daily_path, os.path.basename(daily_path))
+        combined_path = get_l1l2_combined_path(INSTRUMENT_LABEL)
+        await asyncio.to_thread(upload_file_to_drive, combined_path, os.path.basename(combined_path))
 
 
 async def run_websocket_with_retry():
@@ -462,7 +631,7 @@ async def run_websocket_with_retry():
             backoff = 5  # reset after a successful connect
             consecutive_failures = 0
             # The SDK's own thread drives the socket; just idle here and
-            # let seconds_timer_loop / google_drive_sync_loop keep running.
+            # let google_drive_sync_loop keep running.
             while True:
                 await asyncio.sleep(30)
         except Exception as e:
@@ -483,10 +652,9 @@ async def run_websocket_with_retry():
 async def main():
     os.makedirs(BASE_DATA_DIR, exist_ok=True)
 
-    logger.info("Starting real-time data loops...")
+    logger.info(f"Starting real-time L1+L2 collection for {FYERS_SYMBOL}...")
     await asyncio.gather(
         run_websocket_with_retry(),
-        seconds_timer_loop(),
         google_drive_sync_loop(),
     )
 
