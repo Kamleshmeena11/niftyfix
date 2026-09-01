@@ -7,11 +7,9 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import pandas as pd
 
-# Fyers SDK (v3) Correct Imports
 from fyers_apiv3 import fyersModel
 from fyers_apiv3.FyersWebsocket import data_ws
 
-# Google Drive Modules
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google.oauth2.credentials import Credentials
@@ -175,10 +173,11 @@ def on_message(message):
         ltp = message.get("ltp")
         if symbol in tick_buckets and ltp is not None:
             ltt = message.get("ltt", int(time.time()))
+            vol = message.get("vol_traded_today", message.get("v", 0))
             tick_epoch_sec = int(ltt)
             tick_buckets[symbol].setdefault(tick_epoch_sec, []).append({
                 "price": float(ltp),
-                "volume": float(message.get("vol_traded_today", 0))
+                "volume": float(vol)
             })
     except Exception as e:
         logger.error(f"Error parsing feed message: {e}")
@@ -196,7 +195,7 @@ def on_open(fyers_socket):
     logger.info("Connected to Fyers Data Socket. Subscribing to symbols...")
     symbols = list(INSTRUMENTS.keys())
     fyers_socket.subscribe(symbols=symbols, data_type="SymbolUpdate")
-    fyers_socket.keep_running()
+    # REMOVED: fyers_socket.keep_running() to allow asyncio tasks to run
 
 
 async def seconds_timer_loop():
@@ -217,6 +216,10 @@ async def google_drive_sync_loop():
 
 
 async def main():
+    if not FYERS_ACCESS_TOKEN or not FYERS_APP_ID:
+        logger.error("FYERS_APP_ID or FYERS_ACCESS_TOKEN environment variable is missing.")
+        return
+
     os.makedirs(BASE_DATA_DIR, exist_ok=True)
     app_id_full = f"{FYERS_APP_ID}-{FYERS_APP_TYPE}"
 
