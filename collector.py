@@ -116,56 +116,57 @@ def generate_access_token_via_totp() -> str:
     session = requests.Session()
     base = "https://api-t2.fyers.in/vagator/v2"
 
+    def _post(url: str, payload: dict, step_name: str, headers: dict = None):
+        resp = session.post(url, json=payload, headers=headers)
+        if not resp.ok:
+            raise RuntimeError(f"{step_name} failed ({resp.status_code}): {resp.text}")
+        return resp
+
     # Step 1: send login OTP request for the client id
-    r1 = session.post(f"{base}/send_login_otp", json={
-        "fy_id": FYERS_FY_ID,
-        "app_id": "2"
-    })
-    r1.raise_for_status()
+    r1 = _post(f"{base}/send_login_otp", {"fy_id": FYERS_FY_ID, "app_id": "2"}, "send_login_otp")
     request_key = r1.json()["request_key"]
 
     # Step 2: verify TOTP
     totp_code = pyotp.TOTP(FYERS_TOTP_SECRET).now()
-    r2 = session.post(f"{base}/verify_otp", json={
-        "request_key": request_key,
-        "otp": totp_code
-    })
-    r2.raise_for_status()
+    r2 = _post(f"{base}/verify_otp", {"request_key": request_key, "otp": totp_code}, "verify_otp")
     request_key_2 = r2.json()["request_key"]
 
     # Step 3: verify PIN, get an internal session token
-    r3 = session.post(f"{base}/verify_pin", json={
+    r3 = _post(f"{base}/verify_pin", {
         "request_key": request_key_2,
         "identity_type": "pin",
         "identifier": FYERS_PIN
-    })
-    r3.raise_for_status()
+    }, "verify_pin")
     internal_token = r3.json()["data"]["access_token"]
 
     # Step 4: exchange internal session token for an auth_code against your app
     headers = {"Authorization": f"Bearer {internal_token}"}
-    app_id_hash = fyersModel.SessionModel(
-        client_id=f"{FYERS_APP_ID}-{FYERS_APP_TYPE}",
-        secret_key=FYERS_SECRET_KEY,
-        redirect_uri=FYERS_REDIRECT_URI,
-        response_type="code",
-        grant_type="authorization_code"
-    ).appIdHash if hasattr(fyersModel.SessionModel, "appIdHash") else None
-
     token_payload = {
         "fyers_id": FYERS_FY_ID,
         "app_id": FYERS_APP_ID,
         "redirect_uri": FYERS_REDIRECT_URI,
         "appType": FYERS_APP_TYPE,
         "code_challenge": "",
-        "state": "state",
+        "state": "sample_state",
         "scope": "",
         "nonce": "",
         "response_type": "code",
         "create_cookie": True
     }
-    r4 = session.post("https://api-t2.fyers.in/api/v3/token", json=token_payload, headers=headers)
-    r4.raise_for_status()
+    # IMPORTANT: this endpoint returns HTTP 308 on success with the
+    # redirect URL in the JSON body — it must NOT be auto-followed,
+    # or requests silently POSTs to redirect_uri instead and you get
+    # an unrelated 400 back from that page.
+    r4 = session.post(
+        "https://api-t2.fyers.in/api/v3/token",
+        json=token_payload,
+        headers=headers,
+        allow_redirects=False
+    )
+    if r4.status_code != 308:
+        raise RuntimeError(
+            f"Unexpected status {r4.status_code} during auth_code exchange: {r4.text}"
+        )
     r4_data = r4.json()
     redirect_url = r4_data.get("Url") or r4_data.get("url")
     if not redirect_url or "auth_code=" not in redirect_url:
@@ -403,6 +404,8 @@ async def run_websocket_with_retry():
     """Keep the data socket alive, regenerating the token if the server
     rejects it and reconnecting with backoff instead of dying silently."""
     backoff = 5
+    consecutive_failures = 0
+    max_consecutive_failures = 6  # stop wasting the 6h job on bad credentials
     while True:
         try:
             access_token = get_valid_access_token()
@@ -421,12 +424,22 @@ async def run_websocket_with_retry():
             )
             fyers_ws.connect()
             backoff = 5  # reset after a successful connect
+            consecutive_failures = 0
             # The SDK's own thread drives the socket; just idle here and
             # let seconds_timer_loop / google_drive_sync_loop keep running.
             while True:
                 await asyncio.sleep(30)
         except Exception as e:
+            consecutive_failures += 1
             logger.error(f"WebSocket loop crashed: {e} — retrying in {backoff}s")
+            if consecutive_failures >= max_consecutive_failures:
+                logger.error(
+                    f"Giving up after {consecutive_failures} consecutive failures — "
+                    "this looks like a credentials/config problem, not a transient outage. "
+                    "Check FYERS_FY_ID / FYERS_TOTP_SECRET / FYERS_PIN / FYERS_APP_ID / "
+                    "FYERS_SECRET_KEY / FYERS_REDIRECT_URI secrets."
+                )
+                raise
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
