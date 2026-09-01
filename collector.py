@@ -113,6 +113,26 @@ def generate_access_token_via_totp() -> str:
             f"Cannot auto-generate Fyers token, missing env vars: {', '.join(missing)}"
         )
 
+    def _mask(v: str) -> str:
+        v = v.strip()
+        if len(v) <= 4:
+            return "*" * len(v)
+        return f"{v[:2]}***{v[-2:]} (len={len(v)})"
+
+    logger.info(
+        f"Using FYERS_APP_ID={_mask(FYERS_APP_ID)} "
+        f"FYERS_APP_TYPE={FYERS_APP_TYPE!r} "
+        f"FYERS_REDIRECT_URI={FYERS_REDIRECT_URI!r}"
+    )
+    if FYERS_APP_ID != FYERS_APP_ID.strip():
+        logger.warning("FYERS_APP_ID has leading/trailing whitespace — this will break auth.")
+    if "-" in FYERS_APP_ID:
+        logger.warning(
+            f"FYERS_APP_ID contains a '-' ({_mask(FYERS_APP_ID)}) — it should be ONLY the "
+            "app id, e.g. 'XY0W1234', NOT 'XY0W1234-100'. The '-100' app type suffix is "
+            "appended separately by this script."
+        )
+
     session = requests.Session()
     base = "https://api-t2.fyers.in/vagator/v2"
 
