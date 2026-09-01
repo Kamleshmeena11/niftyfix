@@ -133,6 +133,9 @@ BASE_DATA_DIR = "data"
 RAW_DATA_FILENAME = "RawData.csv"
 LEVEL2_FILENAME = "Level2.csv"
 
+# Header row written once at the top of a brand-new RawData.csv.
+RAW_DATA_HEADER = "Timestamp;Price;Bid;Ask;Volume"
+
 
 # =========================================================
 # --- Automatic Fyers token generation (TOTP login flow) ---
@@ -312,29 +315,28 @@ def get_valid_access_token() -> str:
     return generate_access_token_via_totp()
 
 # =========================================================
-# --- L1/L2 pipe-format output (matches UltraLinkQuantowerBridge_GDrive.cs) ---
+# --- L1/L2 output (RawData.csv: Timestamp;Price;Bid;Ask;Volume)
+# --- (Level2.csv unchanged: matches UltraLinkQuantowerBridge_GDrive.cs) ---
 # =========================================================
 #
-#   L1 line:  L1;{side};{yyyyMMddHHmmss};{ffffff};{price};{size}
+#   L1 line:  {yyyyMMdd HHmmss fffffff};{price};{bid};{ask};{volume}
 #   L2 line:  L2;{side};{yyyyMMddHHmmss};{ffffff};{op};{level};;{price};{size}
 #
 #   side  : 0 = ask/offer side, 1 = bid side
 #   op    : 0 = level inserted/changed, 2 = level dropped (size forced to 0)
 #   level : 0-based depth index on that side, 0 = best price
 #
-# CHANGED FROM THE C# SOURCE: the C# indicator interleaves L1 and L2 lines
-# into ONE local file (see its header comment). This collector instead
-# writes them to TWO SEPARATE, ever-growing files — one for the L1 tape,
-# one for the L2 DOM diffs — both living inside a single per-instrument
-# folder (e.g. "tcs/"), while keeping the exact same per-line wire format
-# for each line type. No daily rotation, no duplicate daily+combined
-# copies — just RawData.csv and Level2.csv, appended to forever.
+# RawData.csv gets one header row ("Timestamp;Price;Bid;Ask;Volume") the
+# first time the file is created, then one data row per trade: the trade
+# timestamp, the trade price, and the best bid/ask in force *at that
+# moment*, plus the trade's volume.
 #
 # NOTE ON TIMESTAMP PRECISION: Fyers' feed only gives trade time (ltt) to
-# 1-second resolution and doesn't expose exchange-side microseconds the way
-# the raw NT8 tape does. The {ffffff} field here is filled from local
-# receipt-time microseconds so lines stay strictly orderable, but it is
-# NOT the exchange's true tick timestamp the way the C# source is.
+# 1-second resolution and doesn't expose exchange-side sub-second ticks the
+# way the raw NT8 tape does. The 7-digit fraction here is filled from local
+# receipt-time microseconds (scaled x10 to approximate .NET's 100ns "tick"
+# fraction) so lines stay strictly orderable and match the expected 7-digit
+# width — it is NOT the exchange's true tick timestamp.
 
 def get_raw_data_path(label: str) -> str:
     return os.path.join(BASE_DATA_DIR, label, RAW_DATA_FILENAME)
@@ -351,8 +353,15 @@ def append_pipe_line(path: str, line: str):
 
 
 def write_l1_line(label: str, line: str):
-    """Appends one 'L1;' tape line to <label>/RawData.csv."""
-    append_pipe_line(get_raw_data_path(label), line)
+    """Appends one data row to <label>/RawData.csv, writing the
+    'Timestamp;Price;Bid;Ask;Volume' header first if the file is new."""
+    path = get_raw_data_path(label)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    is_new_file = not os.path.exists(path) or os.path.getsize(path) == 0
+    with open(path, "a", encoding="utf-8") as f:
+        if is_new_file:
+            f.write(RAW_DATA_HEADER + "\n")
+        f.write(line + "\n")
 
 
 def write_l2_line(label: str, line: str):
@@ -377,11 +386,25 @@ def fmt_num(x) -> str:
 
 def format_nt8_timestamp(dt: datetime, micros_override: int = None):
     """Returns (datePart, fracPart) as 'yyyyMMddHHmmss' and 6-digit
-    microseconds, matching FormatNt8Timestamp() in the C# source."""
+    microseconds, matching FormatNt8Timestamp() in the C# source. Used for
+    the L2 (Level2.csv) lines only."""
     date_part = dt.strftime("%Y%m%d%H%M%S")
     micros = micros_override if micros_override is not None else dt.microsecond
     frac_part = f"{micros:06d}"
     return date_part, frac_part
+
+
+def format_l1_timestamp(dt: datetime, micros_override: int = None) -> str:
+    """Returns a single 'yyyyMMdd HHmmss fffffff' string for RawData.csv —
+    a space-separated date, time, and 7-digit sub-second fraction. Python
+    only has microsecond (6-digit) resolution, so the fraction is scaled
+    x10 to fill the 7-digit width the same way .NET's 100ns tick fraction
+    would (e.g. .390680s -> 3906800)."""
+    date_time_part = dt.strftime("%Y%m%d %H%M%S")
+    micros = micros_override if micros_override is not None else dt.microsecond
+    ticks_frac = micros * 10
+    frac_part = f"{ticks_frac:07d}"
+    return f"{date_time_part} {frac_part}"
 
 
 # --- Per-instrument state (single symbol here, but keyed for extensibility) ---
@@ -474,10 +497,10 @@ def diff_dom_side(side: int, current: list, previous: list, date_part: str, frac
 
 
 def handle_trade_message(message: dict):
-    """Handles a SymbolUpdate (trade/quote) message -> emits an 'L1;' line
-    for each new trade, written to the L1-only files. Per-trade size is
-    derived from the delta in Fyers' cumulative 'vol_traded_today' field
-    (Fyers doesn't reliably expose a per-tick 'ltq' on this feed in all
+    """Handles a SymbolUpdate (trade/quote) message -> emits one row per new
+    trade to RawData.csv in 'Timestamp;Price;Bid;Ask;Volume' format. Per-trade
+    size is derived from the delta in Fyers' cumulative 'vol_traded_today'
+    field (Fyers doesn't reliably expose a per-tick 'ltq' on this feed in all
     cases)."""
     symbol = message.get("symbol")
     state = _state.get(symbol)
@@ -523,18 +546,20 @@ def handle_trade_message(message: dict):
     # ltt only has 1-second resolution; use current receipt-time microseconds
     # so lines stay orderable (see module-level NOTE above).
     recv_micros = datetime.now(IST).microsecond
-    date_part, frac_part = format_nt8_timestamp(trade_dt, micros_override=recv_micros)
+    timestamp_str = format_l1_timestamp(trade_dt, micros_override=recv_micros)
+    bid_str = fmt_num(best_bid) if best_bid is not None else "0"
+    ask_str = fmt_num(best_ask) if best_ask is not None else "0"
 
     if FYERS_SPLIT_PRINTS:
-        # Matches the C# script's SplitPrints: emit `lots` separate lines,
-        # each with volume=1, all sharing the same timestamp (same trade
-        # moment) -- so a 5-lot print becomes 5 lines instead of 1.
+        # Matches the C# script's SplitPrints: emit `lots` separate rows,
+        # each with volume=1, all sharing the same timestamp/price/bid/ask
+        # (same trade moment) -- so a 5-lot print becomes 5 rows instead of 1.
         lots = max(1, int(round(size)))
         for _ in range(lots):
-            line = f"L1;{side};{date_part};{frac_part};{fmt_num(ltp)};1"
+            line = f"{timestamp_str};{fmt_num(ltp)};{bid_str};{ask_str};1"
             write_l1_line(INSTRUMENT_LABEL, line)
     else:
-        line = f"L1;{side};{date_part};{frac_part};{fmt_num(ltp)};{fmt_num(size)}"
+        line = f"{timestamp_str};{fmt_num(ltp)};{bid_str};{ask_str};{fmt_num(size)}"
         write_l1_line(INSTRUMENT_LABEL, line)
 
 
@@ -746,7 +771,7 @@ def _tbt_apply_side(side_label: str, levels, side_code: int, date_part: str, fra
 def handle_tbt_socket_message(data: bytes):
     """Parses one binary TBT SocketMessage and emits 'L2;' lines for
     whichever levels actually changed, in the same wire format as the
-    standard-feed path so RawData.csv/Level2.csv stay consistent."""
+    standard-feed path so Level2.csv stays consistent."""
     socket_message = fyers_tbt_pb2.SocketMessage()
     socket_message.ParseFromString(data)
 
