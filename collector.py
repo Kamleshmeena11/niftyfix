@@ -85,6 +85,14 @@ INSTRUMENT_LABEL = "tcs"
 # simply get fewer, and if it sends more you now capture up to 50.
 DOM_LEVELS = int(os.environ.get("FYERS_DOM_LEVELS", "50"))
 
+# Temporary debug aid: log the first N raw DepthUpdate messages, completely
+# unparsed, so you can see exactly what fields/levels Fyers is actually
+# sending (rather than trusting what extract_depth_levels() picked out).
+# Set to 0 to disable. Safe to leave on briefly, then turn back off --
+# it only fires a bounded number of times, not on every message.
+FYERS_DEBUG_RAW_DEPTH_MESSAGES = int(os.environ.get("FYERS_DEBUG_RAW_DEPTH_MESSAGES", "5"))
+_raw_depth_debug_count = 0
+
 # Optional: split each trade print into N separate 1-volume lines, matching
 # the C# indicator's "Split multi-lot prints into 1-lot lines (matches NT8
 # 1-Volume series)" behavior. On by default, like the C# script.
@@ -507,6 +515,11 @@ def handle_depth_message(message: dict):
     """Handles a DepthUpdate message -> diffs against the previous snapshot
     and emits 'L2;' lines only for levels that actually changed, written to
     the L2-only files."""
+    global _raw_depth_debug_count
+    if FYERS_DEBUG_RAW_DEPTH_MESSAGES and _raw_depth_debug_count < FYERS_DEBUG_RAW_DEPTH_MESSAGES:
+        _raw_depth_debug_count += 1
+        logger.info(f"[RAW DEPTH DEBUG {_raw_depth_debug_count}/{FYERS_DEBUG_RAW_DEPTH_MESSAGES}] {message}")
+
     symbol = message.get("symbol")
     state = _state.get(symbol)
     if state is None:
