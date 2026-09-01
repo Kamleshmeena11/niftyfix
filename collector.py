@@ -9,10 +9,19 @@ from zoneinfo import ZoneInfo
 
 import requests
 import pyotp
+import websockets  # needed only when FYERS_DEPTH_SOURCE=tbt
 
 # Fyers SDK (v3)
 from fyers_apiv3 import fyersModel
 from fyers_apiv3.FyersWebsocket import data_ws
+
+# TBT (Versova) protobuf schema — generated from Fyers' official msg.proto,
+# only needed when FYERS_DEPTH_SOURCE=tbt. Ship msg_pb2.py alongside this
+# file (see accompanying msg.proto / build instructions).
+try:
+    import msg_pb2 as fyers_tbt_pb2
+except ImportError:
+    fyers_tbt_pb2 = None
 
 # Google Drive
 from googleapiclient.discovery import build
@@ -84,6 +93,24 @@ INSTRUMENT_LABEL = "tcs"
 # slices to that cap, so if Fyers sends fewer levels for a given symbol you
 # simply get fewer, and if it sends more you now capture up to 50.
 DOM_LEVELS = int(os.environ.get("FYERS_DOM_LEVELS", "50"))
+
+# --- Depth source selection ---
+# "standard" (default): the existing data_ws DepthUpdate feed used below.
+# For equity cash symbols (like NSE:TCS-EQ) Fyers only ever sends a handful
+# of levels (5, occasionally a bit more) on this feed regardless of what
+# DOM_LEVELS is set to — there is no server-side way to ask for more.
+#
+# "tbt": Fyers' separate Tick-By-Tick / "Versova" protobuf WebSocket, which
+# is the ONLY Fyers feed that actually carries up to 50 depth levels.
+# IMPORTANT CAVEAT (confirmed from Fyers' own docs/community as of writing):
+# TBT is currently available for NFO (NSE F&O) instruments only — NOT for
+# NSE cash-market equities such as NSE:TCS-EQ. If you point this at an
+# equity symbol, expect either no data or a connection/auth rejection.
+# If you need 50-level depth on TCS specifically, you'd need to trade the
+# TCS futures contract's symbol instead, or confirm with Fyers support
+# whether NSECM TBT has since been enabled for your account.
+FYERS_DEPTH_SOURCE = os.environ.get("FYERS_DEPTH_SOURCE", "standard").strip().lower()
+FYERS_TBT_WS_URL = os.environ.get("FYERS_TBT_WS_URL", "wss://rtsocket-api.fyers.in/versova")
 
 # Temporary debug aid: log the first N raw DepthUpdate messages, completely
 # unparsed, so you can see exactly what fields/levels Fyers is actually
@@ -591,9 +618,16 @@ def on_close(message):
 
 
 def on_open(fyers_socket):
-    logger.info(f"Connected to Fyers Data Socket. Subscribing to {FYERS_SYMBOL} (L1 + L2)...")
-    fyers_socket.subscribe(symbols=[FYERS_SYMBOL], data_type="SymbolUpdate")
-    fyers_socket.subscribe(symbols=[FYERS_SYMBOL], data_type="DepthUpdate")
+    if FYERS_DEPTH_SOURCE == "tbt":
+        # Depth is coming from the separate TBT socket in this mode — only
+        # take trades (L1) from the standard socket, to avoid writing
+        # Level2.csv from two independent feeds at once.
+        logger.info(f"Connected to Fyers Data Socket. Subscribing to {FYERS_SYMBOL} (L1 only — depth via TBT)...")
+        fyers_socket.subscribe(symbols=[FYERS_SYMBOL], data_type="SymbolUpdate")
+    else:
+        logger.info(f"Connected to Fyers Data Socket. Subscribing to {FYERS_SYMBOL} (L1 + L2)...")
+        fyers_socket.subscribe(symbols=[FYERS_SYMBOL], data_type="SymbolUpdate")
+        fyers_socket.subscribe(symbols=[FYERS_SYMBOL], data_type="DepthUpdate")
     fyers_socket.keep_running()
 
 
@@ -661,6 +695,150 @@ async def google_drive_sync_loop():
         await asyncio.to_thread(upload_file_to_drive, level2_path, LEVEL2_FILENAME, INSTRUMENT_LABEL)
 
 
+# =========================================================
+# --- TBT (Versova) 50-level depth feed — opt-in, protobuf over WS ---
+# =========================================================
+# IMPORTANT: unlike the standard DepthUpdate feed (which appears to send a
+# full book snapshot on every message, hence the simple diff_dom_side()
+# full-list-vs-full-list comparison used above), Fyers' TBT feed sends a
+# FULL snapshot only on the first message per symbol (feed.snapshot=True),
+# and INCREMENTAL per-level updates after that — a message may carry only
+# one changed level. So this keeps a persistent 50-slot book per side and
+# only compares/emits for the levels actually present in each message;
+# levels not mentioned in an incremental update are left untouched (NOT
+# treated as dropped — that was wrong in an earlier draft of this code).
+_tbt_book = {
+    "asks": {i: None for i in range(DOM_LEVELS)},  # level -> (price, qty) or None
+    "bids": {i: None for i in range(DOM_LEVELS)},
+}
+
+
+def _tbt_apply_side(side_label: str, levels, side_code: int, date_part: str, frac_part: str) -> list:
+    """Merges incoming MarketLevel entries into the persistent per-level
+    book for one side, emitting an L2 line only for levels that actually
+    changed value. price==0 with qty>0 is a known TBT anomaly (per Fyers'
+    own reference app) — treated as 'keep previous price, update qty'."""
+    book = _tbt_book[side_label]
+    out_lines = []
+    for lvl in levels:
+        level = lvl.num.value
+        if level >= DOM_LEVELS:
+            continue
+        price = lvl.price.value / 100.0
+        qty = float(lvl.qty.value)
+        prev = book.get(level)
+
+        if price == 0.0 and qty > 0 and prev is not None:
+            price = prev[0]  # anomaly: preserve last known price
+
+        new_val = (price, qty)
+        if new_val == prev:
+            continue
+        book[level] = new_val
+
+        if qty == 0:
+            out_lines.append(f"L2;{side_code};{date_part};{frac_part};2;{level};;{fmt_num(price)};0")
+        else:
+            out_lines.append(f"L2;{side_code};{date_part};{frac_part};0;{level};;{fmt_num(price)};{fmt_num(qty)}")
+    return out_lines
+
+
+def handle_tbt_socket_message(data: bytes):
+    """Parses one binary TBT SocketMessage and emits 'L2;' lines for
+    whichever levels actually changed, in the same wire format as the
+    standard-feed path so RawData.csv/Level2.csv stay consistent."""
+    socket_message = fyers_tbt_pb2.SocketMessage()
+    socket_message.ParseFromString(data)
+
+    if socket_message.error:
+        logger.error(f"TBT socket error: {socket_message.msg}")
+        return
+
+    for ticker, feed in socket_message.feeds.items():
+        if not feed.HasField("depth"):
+            continue
+
+        if feed.snapshot:
+            # Full snapshot: reset the book so stale levels from a previous
+            # session don't linger, then apply as normal.
+            _tbt_book["asks"] = {i: None for i in range(DOM_LEVELS)}
+            _tbt_book["bids"] = {i: None for i in range(DOM_LEVELS)}
+
+        now = datetime.now(IST)
+        date_part, frac_part = format_nt8_timestamp(now)
+
+        lines = _tbt_apply_side("asks", feed.depth.asks, 0, date_part, frac_part)
+        lines += _tbt_apply_side("bids", feed.depth.bids, 1, date_part, frac_part)
+
+        for line in lines:
+            write_l2_line(INSTRUMENT_LABEL, line)
+
+
+async def run_tbt_depth_with_retry():
+    """Connects to Fyers' TBT/Versova WebSocket for real 50-level depth.
+    Only runs when FYERS_DEPTH_SOURCE=tbt. Reconnects with backoff, same
+    pattern as run_websocket_with_retry()."""
+    if fyers_tbt_pb2 is None:
+        raise RuntimeError(
+            "FYERS_DEPTH_SOURCE=tbt requires msg_pb2.py (compiled from the "
+            "Fyers TBT msg.proto) to be present next to this script, and the "
+            "'websockets' and 'protobuf' packages installed."
+        )
+
+    backoff = 5
+    while True:
+        try:
+            access_token = get_valid_access_token()
+            auth_header = f"{FYERS_APP_ID}-{FYERS_APP_TYPE}:{access_token}"
+
+            logger.info(f"Connecting to Fyers TBT depth feed at {FYERS_TBT_WS_URL} for {FYERS_SYMBOL}...")
+            async with websockets.connect(
+                FYERS_TBT_WS_URL,
+                additional_headers={"Authorization": auth_header},
+                max_size=None,
+            ) as ws:
+                subscribe_msg = {
+                    "type": 1,
+                    "data": {
+                        "subs": 1,
+                        "symbols": [FYERS_SYMBOL],
+                        "mode": "depth",
+                        "channel": "1",
+                    },
+                }
+                await ws.send(json.dumps(subscribe_msg))
+                await ws.send(json.dumps({
+                    "type": 2,
+                    "data": {"resumeChannels": ["1"], "pauseChannels": []},
+                }))
+                logger.info("TBT depth feed subscribed.")
+                backoff = 5
+
+                last_ping = time.time()
+                while True:
+                    if time.time() - last_ping >= 30:
+                        await ws.send("ping")
+                        last_ping = time.time()
+                    try:
+                        message = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        continue
+                    if isinstance(message, bytes):
+                        try:
+                            handle_tbt_socket_message(message)
+                        except Exception as e:
+                            logger.error(f"Error parsing TBT message: {e}")
+                    else:
+                        logger.info(f"TBT text message: {message}")
+        except Exception as e:
+            logger.error(f"TBT depth socket crashed: {e} — retrying in {backoff}s. "
+                         "If this keeps happening, TBT may not be enabled for this "
+                         "symbol/segment on your account (it's currently NFO-only "
+                         "per Fyers' docs) — check whether NSE:TCS-EQ is supported.")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+
+
 async def run_websocket_with_retry():
     """Keep the data socket alive, regenerating the token if the server
     rejects it and reconnecting with backoff instead of dying silently."""
@@ -708,11 +886,14 @@ async def run_websocket_with_retry():
 async def main():
     os.makedirs(BASE_DATA_DIR, exist_ok=True)
 
-    logger.info(f"Starting real-time L1+L2 collection for {FYERS_SYMBOL}...")
-    await asyncio.gather(
-        run_websocket_with_retry(),
-        google_drive_sync_loop(),
-    )
+    logger.info(f"Starting real-time L1+L2 collection for {FYERS_SYMBOL} "
+                f"(depth source: {FYERS_DEPTH_SOURCE})...")
+
+    tasks = [run_websocket_with_retry(), google_drive_sync_loop()]
+    if FYERS_DEPTH_SOURCE == "tbt":
+        tasks.append(run_tbt_depth_with_retry())
+
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":
