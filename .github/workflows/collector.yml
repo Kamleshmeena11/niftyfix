@@ -1,4 +1,4 @@
-name: 📈 Nifty 1s Bar Collector (Fyers)
+name: "📈 Nifty 1s Bar Collector (Fyers)"
 
 on:
   workflow_dispatch:
@@ -7,8 +7,10 @@ jobs:
   collect:
     name: Collect Market Data
     runs-on: ubuntu-latest
-    timeout-minutes: 375
-
+    # GitHub-hosted runners hard-cap every job at 360 minutes (6h),
+    # regardless of what you set here. 375 was silently truncated/
+    # force-cancelled at the cap — hence "The operation was canceled."
+    timeout-minutes: 360
     steps:
       - name: ⬇️ Checkout
         uses: actions/checkout@v4
