@@ -77,7 +77,18 @@ TOKEN_CACHE_PATH = "fyers_token_cache.json"
 # --- Instrument (single symbol, Level 1 + Level 2) ---
 FYERS_SYMBOL = os.environ.get("FYERS_SYMBOL", "NSE:TCS-EQ")
 INSTRUMENT_LABEL = "tcs"
+# NOTE ON DEPTH: Fyers' standard "DepthUpdate" websocket feed (subscribed to
+# below) only ever sends 5 levels per side, regardless of this setting --
+# it is a limit of that feed/subscription tier, not of this script. Fyers
+# does offer a separate higher-tier "TBT" (Tick-By-Tick) feed with up to 50
+# levels, but that requires a different subscription/integration entirely
+# and is NOT what data_ws's DepthUpdate provides.
 DOM_LEVELS = int(os.environ.get("FYERS_DOM_LEVELS", "5"))
+
+# Optional: split each trade print into N separate 1-volume lines, matching
+# the C# indicator's "Split multi-lot prints into 1-lot lines (matches NT8
+# 1-Volume series)" behavior. On by default, like the C# script.
+FYERS_SPLIT_PRINTS = os.environ.get("FYERS_SPLIT_PRINTS", "true").strip().lower() not in ("0", "false", "no")
 
 BASE_DATA_DIR = "data"
 
@@ -479,8 +490,17 @@ def handle_trade_message(message: dict):
     recv_micros = datetime.now(IST).microsecond
     date_part, frac_part = format_nt8_timestamp(trade_dt, micros_override=recv_micros)
 
-    line = f"L1;{side};{date_part};{frac_part};{fmt_num(ltp)};{fmt_num(size)}"
-    write_l1_line(INSTRUMENT_LABEL, line)
+    if FYERS_SPLIT_PRINTS:
+        # Matches the C# script's SplitPrints: emit `lots` separate lines,
+        # each with volume=1, all sharing the same timestamp (same trade
+        # moment) -- so a 5-lot print becomes 5 lines instead of 1.
+        lots = max(1, int(round(size)))
+        for _ in range(lots):
+            line = f"L1;{side};{date_part};{frac_part};{fmt_num(ltp)};1"
+            write_l1_line(INSTRUMENT_LABEL, line)
+    else:
+        line = f"L1;{side};{date_part};{frac_part};{fmt_num(ltp)};{fmt_num(size)}"
+        write_l1_line(INSTRUMENT_LABEL, line)
 
 
 def handle_depth_message(message: dict):
