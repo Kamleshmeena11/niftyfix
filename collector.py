@@ -271,18 +271,33 @@ def get_valid_access_token() -> str:
 #   op    : 0 = level inserted/changed, 2 = level dropped (size forced to 0)
 #   level : 0-based depth index on that side, 0 = best price
 #
+# CHANGED FROM THE C# SOURCE: the C# indicator interleaves L1 and L2 lines
+# into ONE local file (see its header comment). This collector instead
+# writes them to TWO SEPARATE files/Drive uploads — one for the L1 tape,
+# one for the L2 DOM diffs — while keeping the exact same per-line wire
+# format for each line type, so a downstream tool can still parse either
+# file the same way it would parse a filtered slice of the combined one.
+#
 # NOTE ON TIMESTAMP PRECISION: Fyers' feed only gives trade time (ltt) to
 # 1-second resolution and doesn't expose exchange-side microseconds the way
 # the raw NT8 tape does. The {ffffff} field here is filled from local
 # receipt-time microseconds so lines stay strictly orderable, but it is
 # NOT the exchange's true tick timestamp the way the C# source is.
 
-def get_l1l2_daily_path(label: str, date_str: str) -> str:
-    return os.path.join(DAILY_DIR, date_str, f"{label}_L1L2_{date_str}.csv")
+def get_l1_daily_path(label: str, date_str: str) -> str:
+    return os.path.join(DAILY_DIR, date_str, f"{label}_L1_{date_str}.csv")
 
 
-def get_l1l2_combined_path(label: str) -> str:
-    return os.path.join(BASE_DATA_DIR, f"{label}_L1L2_ALL.csv")
+def get_l1_combined_path(label: str) -> str:
+    return os.path.join(BASE_DATA_DIR, f"{label}_L1_ALL.csv")
+
+
+def get_l2_daily_path(label: str, date_str: str) -> str:
+    return os.path.join(DAILY_DIR, date_str, f"{label}_L2_{date_str}.csv")
+
+
+def get_l2_combined_path(label: str) -> str:
+    return os.path.join(BASE_DATA_DIR, f"{label}_L2_ALL.csv")
 
 
 def append_pipe_line(path: str, line: str):
@@ -291,10 +306,21 @@ def append_pipe_line(path: str, line: str):
         f.write(line + "\n")
 
 
-def write_l1l2_line(label: str, line: str):
+def write_l1_line(label: str, line: str):
+    """Writes one 'L1;' tape line to today's daily L1 file and the running
+    combined L1 file. Kept separate from L2 so the two data types never
+    share a file or a Drive upload."""
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
-    append_pipe_line(get_l1l2_daily_path(label, today_str), line)
-    append_pipe_line(get_l1l2_combined_path(label), line)
+    append_pipe_line(get_l1_daily_path(label, today_str), line)
+    append_pipe_line(get_l1_combined_path(label), line)
+
+
+def write_l2_line(label: str, line: str):
+    """Writes one 'L2;' DOM-diff line to today's daily L2 file and the
+    running combined L2 file."""
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    append_pipe_line(get_l2_daily_path(label, today_str), line)
+    append_pipe_line(get_l2_combined_path(label), line)
 
 
 def fmt_num(x) -> str:
@@ -412,9 +438,10 @@ def diff_dom_side(side: int, current: list, previous: list, date_part: str, frac
 
 def handle_trade_message(message: dict):
     """Handles a SymbolUpdate (trade/quote) message -> emits an 'L1;' line
-    for each new trade. Per-trade size is derived from the delta in Fyers'
-    cumulative 'vol_traded_today' field (Fyers doesn't reliably expose a
-    per-tick 'ltq' on this feed in all cases)."""
+    for each new trade, written to the L1-only files. Per-trade size is
+    derived from the delta in Fyers' cumulative 'vol_traded_today' field
+    (Fyers doesn't reliably expose a per-tick 'ltq' on this feed in all
+    cases)."""
     symbol = message.get("symbol")
     state = _state.get(symbol)
     if state is None:
@@ -462,12 +489,13 @@ def handle_trade_message(message: dict):
     date_part, frac_part = format_nt8_timestamp(trade_dt, micros_override=recv_micros)
 
     line = f"L1;{side};{date_part};{frac_part};{fmt_num(ltp)};{fmt_num(size)}"
-    write_l1l2_line(INSTRUMENT_LABEL, line)
+    write_l1_line(INSTRUMENT_LABEL, line)
 
 
 def handle_depth_message(message: dict):
     """Handles a DepthUpdate message -> diffs against the previous snapshot
-    and emits 'L2;' lines only for levels that actually changed."""
+    and emits 'L2;' lines only for levels that actually changed, written to
+    the L2-only files."""
     symbol = message.get("symbol")
     state = _state.get(symbol)
     if state is None:
@@ -500,7 +528,7 @@ def handle_depth_message(message: dict):
     state["last_bid_levels"] = bids
 
     for line in lines:
-        write_l1l2_line(INSTRUMENT_LABEL, line)
+        write_l2_line(INSTRUMENT_LABEL, line)
 
 
 # --- Fyers WebSocket callbacks ---
@@ -596,13 +624,22 @@ def upload_file_to_drive(local_path: str, drive_filename: str):
 
 
 async def google_drive_sync_loop():
+    """Syncs four files per cycle: today's L1 file + the running combined
+    L1 file, and today's L2 file + the running combined L2 file — kept
+    fully separate from each other, both locally and on Drive."""
     while True:
         await asyncio.sleep(10)
         today_str = datetime.now(IST).strftime("%Y-%m-%d")
-        daily_path = get_l1l2_daily_path(INSTRUMENT_LABEL, today_str)
-        await asyncio.to_thread(upload_file_to_drive, daily_path, os.path.basename(daily_path))
-        combined_path = get_l1l2_combined_path(INSTRUMENT_LABEL)
-        await asyncio.to_thread(upload_file_to_drive, combined_path, os.path.basename(combined_path))
+
+        l1_daily_path = get_l1_daily_path(INSTRUMENT_LABEL, today_str)
+        await asyncio.to_thread(upload_file_to_drive, l1_daily_path, os.path.basename(l1_daily_path))
+        l1_combined_path = get_l1_combined_path(INSTRUMENT_LABEL)
+        await asyncio.to_thread(upload_file_to_drive, l1_combined_path, os.path.basename(l1_combined_path))
+
+        l2_daily_path = get_l2_daily_path(INSTRUMENT_LABEL, today_str)
+        await asyncio.to_thread(upload_file_to_drive, l2_daily_path, os.path.basename(l2_daily_path))
+        l2_combined_path = get_l2_combined_path(INSTRUMENT_LABEL)
+        await asyncio.to_thread(upload_file_to_drive, l2_combined_path, os.path.basename(l2_combined_path))
 
 
 async def run_websocket_with_retry():
