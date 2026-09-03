@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import json
+import io
 import logging
 import asyncio
 from datetime import datetime
@@ -25,7 +26,7 @@ except ImportError:
 
 # Google Drive
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from google.oauth2.credentials import Credentials
 
 # --- Logging ---
@@ -688,7 +689,12 @@ def get_or_create_drive_folder(service, name: str, parent_id: str = None) -> str
 
 def upload_file_to_drive(local_path: str, drive_filename: str, folder_name: str):
     """Uploads/updates a single file inside ONE Drive folder named
-    `folder_name` (e.g. "tcs") sitting at Drive root — no date subfolders."""
+    `folder_name` (e.g. "tcs") sitting at Drive root — no date subfolders.
+
+    This REPLACES whatever is currently on Drive with local_path's content.
+    That's only safe because download_file_from_drive() (called once at
+    startup, see main()) seeds local_path with the prior Drive content
+    first — so local_path always holds "old + new", never just "new"."""
     if not os.path.exists(local_path) or not all([GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN]):
         return
     try:
@@ -706,6 +712,58 @@ def upload_file_to_drive(local_path: str, drive_filename: str, folder_name: str)
             service.files().create(body={"name": drive_filename, "parents": [parent_id]}, media_body=media).execute()
     except Exception as e:
         logger.error(f"Google Drive Upload Error ({drive_filename}): {e}")
+
+
+def download_file_from_drive(local_path: str, drive_filename: str, folder_name: str):
+    """Seeds local_path with whatever is currently on Drive for
+    `drive_filename` inside `folder_name`, BEFORE any new data is written
+    this run.
+
+    Why this exists: this job typically restarts on an ephemeral filesystem
+    (fresh container), so local_path starts empty every run. Without this,
+    the first google_drive_sync_loop() cycle would call upload_file_to_drive(),
+    which does an in-place Drive *replace* — overwriting all of yesterday's
+    (or this morning's) accumulated history with just the handful of rows
+    written since restart. Downloading first means local_path already
+    contains the full prior history, so every subsequent write appends onto
+    it and every subsequent Drive sync re-uploads "old + new" rather than
+    "new only" — i.e. data combines across restarts instead of being wiped.
+
+    No-ops (leaves local_path alone) if Drive isn't configured, if nothing
+    exists there yet (first-ever run), or on any error — so a transient
+    Drive hiccup at startup degrades to "start fresh locally" rather than
+    crashing the job.
+    """
+    if not all([GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN]):
+        return
+    try:
+        service = _get_drive_service()
+        parent_id = get_or_create_drive_folder(service, folder_name)
+
+        query = f"name = '{drive_filename}' and trashed = false and '{parent_id}' in parents"
+        results = service.files().list(q=query, fields="files(id)").execute()
+        files = results.get("files", [])
+        if not files:
+            logger.info(f"No existing '{drive_filename}' on Drive under '{folder_name}' — starting fresh.")
+            return
+
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        request = service.files().get_media(fileId=files[0]["id"])
+        with io.FileIO(local_path, "wb") as fh:
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+
+        logger.info(
+            f"Restored '{drive_filename}' from Drive "
+            f"({os.path.getsize(local_path)} bytes) — new data will be appended onto it."
+        )
+    except Exception as e:
+        logger.error(
+            f"Google Drive Download Error ({drive_filename}): {e} — "
+            "continuing with a fresh local file for this run."
+        )
 
 
 async def google_drive_sync_loop():
@@ -915,6 +973,23 @@ async def main():
 
     logger.info(f"Starting real-time L1+L2 collection for {FYERS_SYMBOL} "
                 f"(depth source: {FYERS_DEPTH_SOURCE})...")
+
+    # Restore prior data from Drive BEFORE anything writes locally. This is
+    # the fix for the "overwrites previous data" problem: if this run's
+    # local RawData.csv/Level2.csv start empty (fresh container) and we
+    # skip this step, the first google_drive_sync_loop() upload replaces
+    # Drive's accumulated file with an almost-empty one. Pulling the
+    # existing Drive copy down first means local writes append onto the
+    # full history, so it keeps combining across restarts instead of
+    # resetting. Only restores when the local file is missing/empty, so it
+    # never clobbers a local file that already has this run's data (e.g. on
+    # a non-ephemeral host where local state survived a restart).
+    raw_path = get_raw_data_path(INSTRUMENT_LABEL)
+    level2_path = get_level2_path(INSTRUMENT_LABEL)
+    if not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
+        await asyncio.to_thread(download_file_from_drive, raw_path, RAW_DATA_FILENAME, INSTRUMENT_LABEL)
+    if not os.path.exists(level2_path) or os.path.getsize(level2_path) == 0:
+        await asyncio.to_thread(download_file_from_drive, level2_path, LEVEL2_FILENAME, INSTRUMENT_LABEL)
 
     tasks = [run_websocket_with_retry(), google_drive_sync_loop()]
     if FYERS_DEPTH_SOURCE == "tbt":
