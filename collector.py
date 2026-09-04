@@ -129,13 +129,26 @@ FYERS_SPLIT_PRINTS = os.environ.get("FYERS_SPLIT_PRINTS", "true").strip().lower(
 BASE_DATA_DIR = "data"
 
 # Local + Drive layout: ONE folder per instrument (e.g. "tcs"), containing
-# exactly two running files — RawData.csv (L1 tape) and Level2.csv (L2 DOM
-# diffs). No daily sub-folders, no duplicate daily/combined pairs.
+# exactly three running files — RawData.csv (L1 tape), Level2.csv (L2 DOM
+# diffs), and 1Second_tcs.csv (1-second OHLCV bars built from the same
+# trade prints as RawData.csv). No daily sub-folders, no duplicate
+# daily/combined pairs, and no per-second bucketing of Level2 data.
 RAW_DATA_FILENAME = "RawData.csv"
 LEVEL2_FILENAME = "Level2.csv"
+ONE_SECOND_FILENAME = "1Second_tcs.csv"
 
 # Header row written once at the top of a brand-new RawData.csv.
 RAW_DATA_HEADER = "Timestamp;Price;Bid;Ask;Volume"
+
+# Header row written once at the top of a brand-new 1Second_tcs.csv.
+ONE_SECOND_HEADER = "timestamp,instrument_key,open,high,low,close,volume"
+
+# How many seconds we hold a 1-second bucket open after its second has
+# technically elapsed, before finalizing/writing it -- gives slightly
+# late-arriving trade prints (still stamped with the correct trade second)
+# time to land in the right bucket before it's flushed. Same idea as the
+# BUFFER_SECONDS used in the Upstox 1s collector this was ported from.
+ONE_SECOND_BUFFER_SECONDS = int(os.environ.get("FYERS_1S_BUFFER_SECONDS", "2"))
 
 
 # =========================================================
@@ -347,6 +360,10 @@ def get_level2_path(label: str) -> str:
     return os.path.join(BASE_DATA_DIR, label, LEVEL2_FILENAME)
 
 
+def get_one_second_path(label: str) -> str:
+    return os.path.join(BASE_DATA_DIR, label, ONE_SECOND_FILENAME)
+
+
 def append_pipe_line(path: str, line: str):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
@@ -385,6 +402,15 @@ def fmt_num(x) -> str:
     return s if s else "0"
 
 
+def fmt_bar_num(x) -> str:
+    """Plain float-to-string formatting for 1Second_tcs.csv, e.g.
+    0.0 -> '0.0', 57941.5 -> '57941.5'. Deliberately NOT fmt_num() --
+    the target format keeps a trailing '.0' for whole numbers (matching
+    the sample file), whereas fmt_num() strips it for the NT8-style
+    RawData.csv/Level2.csv lines."""
+    return str(float(x))
+
+
 def format_nt8_timestamp(dt: datetime, micros_override: int = None):
     """Returns (datePart, fracPart) as 'yyyyMMddHHmmss' and 6-digit
     microseconds, matching FormatNt8Timestamp() in the C# source. Used for
@@ -408,6 +434,35 @@ def format_l1_timestamp(dt: datetime, micros_override: int = None) -> str:
     return f"{date_time_part} {frac_part}"
 
 
+def write_one_second_bar(label: str, bar_time: datetime, ticks: list):
+    """Writes one finalized 1-second OHLCV bar to <label>/1Second_tcs.csv,
+    built purely from actual trade prints whose own trade-second falls in
+    this bucket (the same prints RawData.csv logs, just aggregated).
+    Format: timestamp,instrument_key,open,high,low,close,volume
+    -- open = first trade's price, high/low = max/min across all trades in
+    the second, close = last trade's price, volume = sum of trade sizes.
+    Level2.csv / depth data is intentionally NOT touched by this."""
+    path = get_one_second_path(label)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    is_new_file = not os.path.exists(path) or os.path.getsize(path) == 0
+
+    prices = [p for p, _ in ticks]
+    volumes = [v for _, v in ticks]
+    bar_str = bar_time.strftime("%Y-%m-%d %H:%M:%S")
+
+    row = (
+        f"{bar_str},{FYERS_SYMBOL},"
+        f"{fmt_bar_num(prices[0])},{fmt_bar_num(max(prices))},"
+        f"{fmt_bar_num(min(prices))},{fmt_bar_num(prices[-1])},"
+        f"{fmt_bar_num(sum(volumes))}"
+    )
+
+    with open(path, "a", encoding="utf-8") as f:
+        if is_new_file:
+            f.write(ONE_SECOND_HEADER + "\n")
+        f.write(row + "\n")
+
+
 # --- Per-instrument state (single symbol here, but keyed for extensibility) ---
 _state = {
     FYERS_SYMBOL: {
@@ -418,6 +473,9 @@ _state = {
         "last_ask_levels": [],  # list[(price, size)], index 0 = best
         "last_bid_levels": [],
         "logged_unrecognized_depth": False,
+        # -- 1-second OHLCV bucketing (independent of the L1/L2 state above) --
+        "one_second_ticks": {},           # epoch_sec -> list[(price, volume)]
+        "one_second_last_flushed_epoch": None,
     }
 }
 
@@ -499,9 +557,11 @@ def diff_dom_side(side: int, current: list, previous: list, date_part: str, frac
 
 def handle_trade_message(message: dict):
     """Handles a SymbolUpdate (trade/quote) message -> emits one row per new
-    trade to RawData.csv in 'Timestamp;Price;Bid;Ask;Volume' format. Per-trade
-    size is derived from the delta in Fyers' cumulative 'vol_traded_today'
-    field (Fyers doesn't reliably expose a per-tick 'ltq' on this feed in all
+    trade to RawData.csv in 'Timestamp;Price;Bid;Ask;Volume' format, and
+    buckets that same trade print into the current 1-second OHLCV bucket
+    (flushed later by flush_ready_one_second_bars()). Per-trade size is
+    derived from the delta in Fyers' cumulative 'vol_traded_today' field
+    (Fyers doesn't reliably expose a per-tick 'ltq' on this feed in all
     cases)."""
     symbol = message.get("symbol")
     state = _state.get(symbol)
@@ -544,6 +604,13 @@ def handle_trade_message(message: dict):
     except (TypeError, ValueError, OSError):
         trade_dt = datetime.now(IST)
 
+    # --- 1-second OHLCV bucket (separate file, separate from RawData.csv
+    # and untouched by FYERS_SPLIT_PRINTS below) -- keyed by the trade's own
+    # second (ltt is already 1s-resolution), so late local delivery doesn't
+    # shift a trade into the wrong bar. Flushed by flush_ready_one_second_bars().
+    epoch_sec = int(trade_dt.timestamp())
+    state["one_second_ticks"].setdefault(epoch_sec, []).append((ltp, size))
+
     # ltt only has 1-second resolution; use current receipt-time microseconds
     # so lines stay orderable (see module-level NOTE above).
     recv_micros = datetime.now(IST).microsecond
@@ -569,7 +636,8 @@ def handle_trade_message(message: dict):
 def handle_depth_message(message: dict):
     """Handles a DepthUpdate message -> diffs against the previous snapshot
     and emits 'L2;' lines only for levels that actually changed, written to
-    the L2-only files."""
+    the L2-only files. (No 1-second bucketing here by design -- only trade
+    prints feed 1Second_tcs.csv, not depth/DOM data.)"""
     global _raw_depth_debug_count
     if FYERS_DEBUG_RAW_DEPTH_MESSAGES and _raw_depth_debug_count < FYERS_DEBUG_RAW_DEPTH_MESSAGES:
         _raw_depth_debug_count += 1
@@ -767,9 +835,9 @@ def download_file_from_drive(local_path: str, drive_filename: str, folder_name: 
 
 
 async def google_drive_sync_loop():
-    """Syncs exactly two files per cycle, both inside the same Drive folder
-    named after the instrument (e.g. "tcs/RawData.csv" and
-    "tcs/Level2.csv")."""
+    """Syncs all three running files per cycle, all inside the same Drive
+    folder named after the instrument (e.g. "tcs/RawData.csv",
+    "tcs/Level2.csv" and "tcs/1Second_tcs.csv")."""
     while True:
         await asyncio.sleep(10)
 
@@ -778,6 +846,55 @@ async def google_drive_sync_loop():
 
         level2_path = get_level2_path(INSTRUMENT_LABEL)
         await asyncio.to_thread(upload_file_to_drive, level2_path, LEVEL2_FILENAME, INSTRUMENT_LABEL)
+
+        one_second_path = get_one_second_path(INSTRUMENT_LABEL)
+        await asyncio.to_thread(upload_file_to_drive, one_second_path, ONE_SECOND_FILENAME, INSTRUMENT_LABEL)
+
+
+# =========================================================
+# --- 1-second OHLCV bar aggregation (separate from Level2.csv) ---
+# =========================================================
+# Ported from a companion Upstox-based 1s collector. Trade prints are
+# bucketed by their own trade-second (see handle_trade_message()) into
+# state["one_second_ticks"], and this loop periodically finalizes/writes
+# any bucket old enough (ONE_SECOND_BUFFER_SECONDS in the past) that no
+# more late trades are expected to land in it. A second with zero trade
+# prints is SKIPPED (not forward-filled) -- same behavior as the Upstox
+# collector this was ported from.
+
+def flush_ready_one_second_bars():
+    """Walks forward second-by-second from the last finalized second up to
+    (now - ONE_SECOND_BUFFER_SECONDS), writing one bar per second that saw
+    at least one trade print. Depth/Level2 data is never touched here."""
+    state = _state[FYERS_SYMBOL]
+    now_epoch = int(time.time())
+    cutoff = now_epoch - ONE_SECOND_BUFFER_SECONDS
+
+    if state["one_second_last_flushed_epoch"] is None:
+        # First call this run -- nothing to backfill, just establish the
+        # starting point so we don't try to flush from the epoch.
+        state["one_second_last_flushed_epoch"] = cutoff - 1
+        return
+
+    for epoch_sec in range(state["one_second_last_flushed_epoch"] + 1, cutoff + 1):
+        ticks = state["one_second_ticks"].pop(epoch_sec, None)
+        if not ticks:
+            continue  # no trade print landed in this second -- bar skipped
+        bar_time = datetime.fromtimestamp(epoch_sec, tz=IST)
+        write_one_second_bar(INSTRUMENT_LABEL, bar_time, ticks)
+
+    state["one_second_last_flushed_epoch"] = cutoff
+
+
+async def one_second_timer_loop():
+    """Wakes up roughly once a second to finalize any 1-second OHLCV bars
+    that have fallen outside the buffer window. Wake-time precision doesn't
+    matter for correctness since bars are keyed by each trade's own
+    trade-second, not by this loop's timing."""
+    while True:
+        now = time.time()
+        await asyncio.sleep(1.0 - (now % 1.0))
+        flush_ready_one_second_bars()
 
 
 # =========================================================
@@ -971,27 +1088,30 @@ async def run_websocket_with_retry():
 async def main():
     os.makedirs(BASE_DATA_DIR, exist_ok=True)
 
-    logger.info(f"Starting real-time L1+L2 collection for {FYERS_SYMBOL} "
+    logger.info(f"Starting real-time L1+L2+1s collection for {FYERS_SYMBOL} "
                 f"(depth source: {FYERS_DEPTH_SOURCE})...")
 
     # Restore prior data from Drive BEFORE anything writes locally. This is
     # the fix for the "overwrites previous data" problem: if this run's
-    # local RawData.csv/Level2.csv start empty (fresh container) and we
-    # skip this step, the first google_drive_sync_loop() upload replaces
-    # Drive's accumulated file with an almost-empty one. Pulling the
-    # existing Drive copy down first means local writes append onto the
-    # full history, so it keeps combining across restarts instead of
-    # resetting. Only restores when the local file is missing/empty, so it
-    # never clobbers a local file that already has this run's data (e.g. on
-    # a non-ephemeral host where local state survived a restart).
+    # local RawData.csv/Level2.csv/1Second_tcs.csv start empty (fresh
+    # container) and we skip this step, the first google_drive_sync_loop()
+    # upload replaces Drive's accumulated file with an almost-empty one.
+    # Pulling the existing Drive copy down first means local writes append
+    # onto the full history, so it keeps combining across restarts instead
+    # of resetting. Only restores when the local file is missing/empty, so
+    # it never clobbers a local file that already has this run's data (e.g.
+    # on a non-ephemeral host where local state survived a restart).
     raw_path = get_raw_data_path(INSTRUMENT_LABEL)
     level2_path = get_level2_path(INSTRUMENT_LABEL)
+    one_second_path = get_one_second_path(INSTRUMENT_LABEL)
     if not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
         await asyncio.to_thread(download_file_from_drive, raw_path, RAW_DATA_FILENAME, INSTRUMENT_LABEL)
     if not os.path.exists(level2_path) or os.path.getsize(level2_path) == 0:
         await asyncio.to_thread(download_file_from_drive, level2_path, LEVEL2_FILENAME, INSTRUMENT_LABEL)
+    if not os.path.exists(one_second_path) or os.path.getsize(one_second_path) == 0:
+        await asyncio.to_thread(download_file_from_drive, one_second_path, ONE_SECOND_FILENAME, INSTRUMENT_LABEL)
 
-    tasks = [run_websocket_with_retry(), google_drive_sync_loop()]
+    tasks = [run_websocket_with_retry(), google_drive_sync_loop(), one_second_timer_loop()]
     if FYERS_DEPTH_SOURCE == "tbt":
         tasks.append(run_tbt_depth_with_retry())
 
