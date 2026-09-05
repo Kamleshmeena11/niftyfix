@@ -126,13 +126,29 @@ _raw_depth_debug_count = 0
 # 1-Volume series)" behavior. On by default, like the C# script.
 FYERS_SPLIT_PRINTS = os.environ.get("FYERS_SPLIT_PRINTS", "true").strip().lower() not in ("0", "false", "no")
 
+# NEW: also write an explicit "L1;{side};{date};{frac};{price};{size}"
+# execution-tag line into Level2.csv for every trade print, alongside the
+# existing "L2;..." depth-diff lines — exactly the combined-file pattern
+# used by UltraLinkQuantowerBridge_GDrive.cs (its L1L2.csv interleaves
+# "L1;" trade lines and "L2;" depth lines). Previously this script only
+# wrote untagged rows to RawData.csv, so nothing downstream had an
+# explicit buy/sell tag to key off of; anything inferring side from
+# comparing Price to the Bid/Ask columns would misclassify trades whenever
+# best_bid/best_ask hadn't been established yet (see the depth-handling
+# fix below), which is why only "buy side" executions were showing up.
+# side 0 = traded at/through the ask (buy aggressor), 1 = traded at/through
+# the bid (sell aggressor), same convention as the "L1;" lines in the C#
+# reference and the "L2;" side field already used below.
+FYERS_WRITE_L1_TAG_LINES = os.environ.get("FYERS_WRITE_L1_TAG_LINES", "true").strip().lower() not in ("0", "false", "no")
+
 BASE_DATA_DIR = "data"
 
 # Local + Drive layout: ONE folder per instrument (e.g. "tcs"), containing
 # exactly three running files — RawData.csv (L1 tape), Level2.csv (L2 DOM
-# diffs), and 1Second_tcs.csv (1-second OHLCV bars built from the same
-# trade prints as RawData.csv). No daily sub-folders, no duplicate
-# daily/combined pairs, and no per-second bucketing of Level2 data.
+# diffs, now also carrying the "L1;" execution-tag lines described above),
+# and 1Second_tcs.csv (1-second OHLCV bars built from the same trade prints
+# as RawData.csv). No daily sub-folders, no duplicate daily/combined pairs,
+# and no per-second bucketing of Level2 data.
 RAW_DATA_FILENAME = "RawData.csv"
 LEVEL2_FILENAME = "Level2.csv"
 ONE_SECOND_FILENAME = "1Second_tcs.csv"
@@ -330,13 +346,18 @@ def get_valid_access_token() -> str:
 
 # =========================================================
 # --- L1/L2 output (RawData.csv: Timestamp;Price;Bid;Ask;Volume)
-# --- (Level2.csv unchanged: matches UltraLinkQuantowerBridge_GDrive.cs) ---
+# --- (Level2.csv format matches UltraLinkQuantowerBridge_GDrive.cs's
+# ---  combined L1L2.csv: "L1;" execution-tag lines interleaved with
+# ---  "L2;" depth-diff lines) ---
 # =========================================================
 #
-#   L1 line:  {yyyyMMdd HHmmss fffffff};{price};{bid};{ask};{volume}
+#   L1 line:  L1;{side};{yyyyMMddHHmmss};{ffffff};{price};{size}
 #   L2 line:  L2;{side};{yyyyMMddHHmmss};{ffffff};{op};{level};;{price};{size}
 #
 #   side  : 0 = ask/offer side, 1 = bid side
+#           (for L1 this is the trade's aggressor side: 0 if traded
+#           at/through the ask (buy execution), 1 if traded at/through the
+#           bid (sell execution), else carried over from the previous trade)
 #   op    : 0 = level inserted/changed, 2 = level dropped (size forced to 0)
 #   level : 0-based depth index on that side, 0 = best price
 #
@@ -383,7 +404,7 @@ def write_l1_line(label: str, line: str):
 
 
 def write_l2_line(label: str, line: str):
-    """Appends one 'L2;' DOM-diff line to <label>/Level2.csv."""
+    """Appends one 'L2;' or 'L1;' pipe-format line to <label>/Level2.csv."""
     append_pipe_line(get_level2_path(label), line)
 
 
@@ -414,7 +435,7 @@ def fmt_bar_num(x) -> str:
 def format_nt8_timestamp(dt: datetime, micros_override: int = None):
     """Returns (datePart, fracPart) as 'yyyyMMddHHmmss' and 6-digit
     microseconds, matching FormatNt8Timestamp() in the C# source. Used for
-    the L2 (Level2.csv) lines only."""
+    the L1 (execution-tag) and L2 (Level2.csv) lines."""
     date_part = dt.strftime("%Y%m%d%H%M%S")
     micros = micros_override if micros_override is not None else dt.microsecond
     frac_part = f"{micros:06d}"
@@ -483,36 +504,69 @@ _state = {
 def extract_depth_levels(message: dict, max_levels: int):
     """
     Flexible extraction to cope with Fyers' undocumented DepthUpdate schema.
+
+    IMPORTANT: this returns None (not []) for a side that this particular
+    message says NOTHING about, and only returns [] for a side the message
+    explicitly reports as empty. That distinction matters a lot to the
+    caller (handle_depth_message): if Fyers ever sends a message that only
+    carries ask data (no bid key at all), we must NOT treat "no bid key"
+    the same as "bid book is now empty" -- doing so was the actual bug:
+    the previous version always returned [] for a missing side, which made
+    handle_depth_message either skip the update (both sides required) or
+    (if only one side matched) silently stop updating best_bid/best_ask
+    for the other side and, worse, diff its levels against an empty list
+    -- wiping out or never establishing that side of the book. That's why
+    only ask-side ("L2;0;...") lines were ever showing up in Level2.csv,
+    best_bid never got set, and every trade downstream fell back to
+    looking like a buy execution (see handle_trade_message: bid_str falls
+    back to the trade price itself whenever best_bid is None, so a
+    sell-side compare against Bid could never actually trigger).
+
     Tries, in order:
       1. Nested list-of-dict shape confirmed from Fyers' REST depth() API:
          message['ask' or 'asks'] / message['bid' or 'bids'], each a list of
          {'price': ..., 'volume': ...} (or 'qty'/'size').
       2. Flat numbered keys: ask_price{i}/ask_size{i}(or ask_qty{i}),
          bid_price{i}/bid_size{i}(or bid_qty{i}) for i in 1..max_levels.
-    Returns (asks, bids) as lists of (price, size) tuples, best price first,
-    or (None, None) if neither shape matches.
+
+    Returns (asks, bids), where each of asks/bids is independently either:
+      - a list of (price, size) tuples, best price first (possibly empty,
+        meaning "this message reports that side as genuinely flat"), or
+      - None, meaning "this message said nothing about that side at all --
+        leave whatever book state you already have for it untouched."
     """
-    ask_raw = message.get("ask") if isinstance(message.get("ask"), list) else message.get("asks")
-    bid_raw = message.get("bid") if isinstance(message.get("bid"), list) else message.get("bids")
+    def conv(levels):
+        out = []
+        for lvl in levels[:max_levels]:
+            if not isinstance(lvl, dict):
+                continue
+            price = lvl.get("price")
+            size = lvl.get("volume", lvl.get("qty", lvl.get("size")))
+            if price is None or size is None:
+                continue
+            try:
+                out.append((float(price), float(size)))
+            except (TypeError, ValueError):
+                continue
+        return out
 
-    if isinstance(ask_raw, list) and isinstance(bid_raw, list) and (ask_raw or bid_raw):
-        def conv(levels):
-            out = []
-            for lvl in levels[:max_levels]:
-                if not isinstance(lvl, dict):
-                    continue
-                price = lvl.get("price")
-                size = lvl.get("volume", lvl.get("qty", lvl.get("size")))
-                if price is None or size is None:
-                    continue
-                try:
-                    out.append((float(price), float(size)))
-                except (TypeError, ValueError):
-                    continue
-            return out
-        return conv(ask_raw), conv(bid_raw)
+    ask_field = message.get("ask") if isinstance(message.get("ask"), list) else message.get("asks")
+    bid_field = message.get("bid") if isinstance(message.get("bid"), list) else message.get("bids")
 
-    asks, bids = [], []
+    asks = conv(ask_field) if isinstance(ask_field, list) else None
+    bids = conv(bid_field) if isinstance(bid_field, list) else None
+
+    if asks is not None or bids is not None:
+        return asks, bids
+
+    # Flat numbered-key fallback. A side only counts as "present" here if at
+    # least one of its numbered keys actually appears in the message --
+    # otherwise we'd again collapse "no data about this side" into "empty",
+    # which is exactly the bug described above.
+    ask_keys_present = any(f"ask_price{i}" in message for i in range(1, max_levels + 1))
+    bid_keys_present = any(f"bid_price{i}" in message for i in range(1, max_levels + 1))
+
+    flat_asks, flat_bids = [], []
     for i in range(1, max_levels + 1):
         ap = message.get(f"ask_price{i}")
         asz = message.get(f"ask_size{i}", message.get(f"ask_qty{i}"))
@@ -520,19 +574,18 @@ def extract_depth_levels(message: dict, max_levels: int):
         bsz = message.get(f"bid_size{i}", message.get(f"bid_qty{i}"))
         if ap is not None and asz is not None:
             try:
-                asks.append((float(ap), float(asz)))
+                flat_asks.append((float(ap), float(asz)))
             except (TypeError, ValueError):
                 pass
         if bp is not None and bsz is not None:
             try:
-                bids.append((float(bp), float(bsz)))
+                flat_bids.append((float(bp), float(bsz)))
             except (TypeError, ValueError):
                 pass
 
-    if asks or bids:
-        return asks, bids
-
-    return None, None
+    asks = flat_asks if ask_keys_present else None
+    bids = flat_bids if bid_keys_present else None
+    return asks, bids
 
 
 def diff_dom_side(side: int, current: list, previous: list, date_part: str, frac_part: str) -> list:
@@ -557,12 +610,13 @@ def diff_dom_side(side: int, current: list, previous: list, date_part: str, frac
 
 def handle_trade_message(message: dict):
     """Handles a SymbolUpdate (trade/quote) message -> emits one row per new
-    trade to RawData.csv in 'Timestamp;Price;Bid;Ask;Volume' format, and
-    buckets that same trade print into the current 1-second OHLCV bucket
-    (flushed later by flush_ready_one_second_bars()). Per-trade size is
-    derived from the delta in Fyers' cumulative 'vol_traded_today' field
-    (Fyers doesn't reliably expose a per-tick 'ltq' on this feed in all
-    cases)."""
+    trade to RawData.csv in 'Timestamp;Price;Bid;Ask;Volume' format, emits a
+    companion 'L1;side;...' execution-tag line to Level2.csv (see the
+    FYERS_WRITE_L1_TAG_LINES comment above), and buckets that same trade
+    print into the current 1-second OHLCV bucket (flushed later by
+    flush_ready_one_second_bars()). Per-trade size is derived from the delta
+    in Fyers' cumulative 'vol_traded_today' field (Fyers doesn't reliably
+    expose a per-tick 'ltq' on this feed in all cases)."""
     symbol = message.get("symbol")
     state = _state.get(symbol)
     if state is None:
@@ -620,6 +674,12 @@ def handle_trade_message(message: dict):
     bid_str = fmt_num(best_bid) if best_bid is not None else fmt_num(ltp)
     ask_str = fmt_num(best_ask) if best_ask is not None else fmt_num(ltp)
 
+    # Same (date, 6-digit-microsecond) pair as the RawData.csv line, just in
+    # the "L2;"-style 6-digit format instead of the 7-digit-tick format, so
+    # the two files line up -- matches how the C# source stamps its "L1;"
+    # companion line off the exact same `t` used for the tape line.
+    l1_date_part, l1_frac_part = format_nt8_timestamp(trade_dt, micros_override=recv_micros)
+
     if FYERS_SPLIT_PRINTS:
         # Matches the C# script's SplitPrints: emit `lots` separate rows,
         # each with volume=1, all sharing the same timestamp/price/bid/ask
@@ -628,16 +688,31 @@ def handle_trade_message(message: dict):
         for _ in range(lots):
             line = f"{timestamp_str};{fmt_num(ltp)};{bid_str};{ask_str};1"
             write_l1_line(INSTRUMENT_LABEL, line)
+            if FYERS_WRITE_L1_TAG_LINES:
+                write_l2_line(INSTRUMENT_LABEL, f"L1;{side};{l1_date_part};{l1_frac_part};{fmt_num(ltp)};1")
     else:
         line = f"{timestamp_str};{fmt_num(ltp)};{bid_str};{ask_str};{fmt_num(size)}"
         write_l1_line(INSTRUMENT_LABEL, line)
+        if FYERS_WRITE_L1_TAG_LINES:
+            write_l2_line(INSTRUMENT_LABEL, f"L1;{side};{l1_date_part};{l1_frac_part};{fmt_num(ltp)};{fmt_num(size)}")
 
 
 def handle_depth_message(message: dict):
     """Handles a DepthUpdate message -> diffs against the previous snapshot
     and emits 'L2;' lines only for levels that actually changed, written to
     the L2-only files. (No 1-second bucketing here by design -- only trade
-    prints feed 1Second_tcs.csv, not depth/DOM data.)"""
+    prints feed 1Second_tcs.csv, not depth/DOM data.)
+
+    Each side (ask/bid) is now handled independently: extract_depth_levels()
+    tells us, per side, whether this message reported anything about it at
+    all. A side we got no data for this message is left completely alone --
+    its best_bid/best_ask and last_*_levels stay whatever they already were,
+    and it is NOT diffed (so it can't spuriously get marked as "dropped").
+    This mirrors how the working Quantower bridge reads the DOM: it pulls
+    one coherent snapshot covering both sides via
+    GetDepthOfMarketAggregatedCollections() and only skips the whole update
+    if *both* sides come back empty -- it never lets one side's absence
+    wipe out the other."""
     global _raw_depth_debug_count
     if FYERS_DEBUG_RAW_DEPTH_MESSAGES and _raw_depth_debug_count < FYERS_DEBUG_RAW_DEPTH_MESSAGES:
         _raw_depth_debug_count += 1
@@ -658,21 +733,22 @@ def handle_depth_message(message: dict):
             )
         return
 
-    asks = asks or []
-    bids = bids or []
-    if asks:
-        state["best_ask"] = asks[0][0]
-    if bids:
-        state["best_bid"] = bids[0][0]
-
     now = datetime.now(IST)
     date_part, frac_part = format_nt8_timestamp(now)
 
-    lines = diff_dom_side(0, asks, state["last_ask_levels"], date_part, frac_part)
-    lines += diff_dom_side(1, bids, state["last_bid_levels"], date_part, frac_part)
+    lines = []
 
-    state["last_ask_levels"] = asks
-    state["last_bid_levels"] = bids
+    if asks is not None:
+        if asks:
+            state["best_ask"] = asks[0][0]
+        lines += diff_dom_side(0, asks, state["last_ask_levels"], date_part, frac_part)
+        state["last_ask_levels"] = asks
+
+    if bids is not None:
+        if bids:
+            state["best_bid"] = bids[0][0]
+        lines += diff_dom_side(1, bids, state["last_bid_levels"], date_part, frac_part)
+        state["last_bid_levels"] = bids
 
     for line in lines:
         write_l2_line(INSTRUMENT_LABEL, line)
@@ -909,6 +985,9 @@ async def one_second_timer_loop():
 # only compares/emits for the levels actually present in each message;
 # levels not mentioned in an incremental update are left untouched (NOT
 # treated as dropped — that was wrong in an earlier draft of this code).
+# This path was already side-independent (asks and bids are always applied
+# separately via _tbt_apply_side for whichever levels the message actually
+# carries) so it did not need the same fix as the standard-feed path above.
 _tbt_book = {
     "asks": {i: None for i in range(DOM_LEVELS)},  # level -> (price, qty) or None
     "bids": {i: None for i in range(DOM_LEVELS)},
