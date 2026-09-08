@@ -1,6 +1,13 @@
 name: "📈 Nifty 1s Bar Collector (Fyers)"
 on:
   workflow_dispatch:
+
+# Needed so GITHUB_TOKEN is allowed to push the data backup commits that
+# upload_file_to_github() makes inside collector.py. Without this, those
+# API calls will 403/404 even though the token is present.
+permissions:
+  contents: write
+
 jobs:
   collect:
     name: Collect Market Data
@@ -32,6 +39,17 @@ jobs:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          # NEW: also back the data up to GitHub (commits under data/tcs/
+          # in this repo), and use it as the restore fallback whenever
+          # Drive isn't configured or has nothing to restore. The default
+          # Actions token already has repo write access here because of
+          # the top-level `permissions: contents: write` above — no extra
+          # secret needs to be created for this.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Optional: how often (seconds) to push a GitHub backup commit.
+          # Defaults to 120 in the script if omitted. Raise this if you'd
+          # rather have fewer, chunkier commits over a 6h run.
+          # GITHUB_SYNC_INTERVAL_SECONDS: "120"
           # NEW: switches the depth source to Fyers' TBT/Versova protobuf
           # feed for real 50-level depth. Set to "standard" (or remove this
           # line) to go back to the original 5-level DepthUpdate feed.
