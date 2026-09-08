@@ -104,6 +104,27 @@ GITHUB_API_BASE = "https://api.github.com"
 # commits fast over a long run (e.g. 10s -> tens of thousands of commits
 # over 6h; 120s -> a few hundred).
 GITHUB_SYNC_INTERVAL_SECONDS = int(os.environ.get("GITHUB_SYNC_INTERVAL_SECONDS", "120"))
+# Which running files actually get pushed to GitHub, as a comma-separated
+# subset of {"raw", "level2", "1s"}. Defaults to all three. RawData.csv and
+# Level2.csv are per-tick data and grow throughout the session -- each sync
+# re-uploads the file's ENTIRE current content (same "replace the whole
+# file" approach as Drive), so on an active symbol they can reach several
+# MB well before the session ends, and large single-request payloads are
+# more likely to hit transient connection drops. If GitHub uploads for
+# those two keep failing, narrow this down, e.g. GITHUB_SYNC_FILES=1s to
+# only back up the (small, slow-growing) 1-second bars to GitHub and lean
+# on Drive + the workflow's end-of-run artifact upload for the raw files.
+GITHUB_SYNC_FILES = {
+    f.strip().lower()
+    for f in os.environ.get("GITHUB_SYNC_FILES", "raw,level2,1s").split(",")
+    if f.strip()
+}
+# Per-request timeout (seconds) for GitHub API calls, and how many times to
+# retry a call that fails with a transient network/connection error (e.g.
+# the SSLEOFError / connection-reset errors GitHub Actions runners
+# occasionally hit on larger uploads).
+GITHUB_REQUEST_TIMEOUT_SECONDS = int(os.environ.get("GITHUB_REQUEST_TIMEOUT_SECONDS", "60"))
+GITHUB_MAX_RETRIES = int(os.environ.get("GITHUB_MAX_RETRIES", "3"))
 
 TOKEN_CACHE_PATH = "fyers_token_cache.json"
 
@@ -977,6 +998,14 @@ def get_github_repo_path(folder_name: str, filename: str) -> str:
     return f"data/{folder_name}/{filename}"
 
 
+# repo_path -> last known blob SHA. Populated after every successful
+# upload/download so upload_file_to_github() usually doesn't need a GET
+# before its PUT -- halves the number of GitHub API round trips per sync,
+# which both reduces load and shrinks the window for a transient network
+# failure to hit mid-sync.
+_github_file_sha_cache: dict = {}
+
+
 def upload_file_to_github(local_path: str, drive_filename: str, folder_name: str):
     """Commits local_path's current content to
     data/<folder_name>/<drive_filename> in the repo, via the Contents API.
@@ -987,34 +1016,86 @@ def upload_file_to_github(local_path: str, drive_filename: str, folder_name: str
     independent copy of the data, living in the repo's commit history.
     Requires GITHUB_TOKEN (with `contents: write` permission on the repo)
     and GITHUB_REPOSITORY to be set; no-ops silently otherwise, same
-    pattern as upload_file_to_drive()."""
+    pattern as upload_file_to_drive().
+
+    Retries GITHUB_MAX_RETRIES times (short backoff) on connection-level
+    failures such as the SSLEOFError/connection-reset errors GitHub Actions
+    runners occasionally hit -- these are far more likely on RawData.csv /
+    Level2.csv once they've grown into the multi-MB range (see the
+    GITHUB_SYNC_FILES comment above)."""
     if not os.path.exists(local_path) or not _github_configured():
         return
     repo_path = get_github_repo_path(folder_name, drive_filename)
     url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPOSITORY}/contents/{repo_path}"
-    try:
-        with open(local_path, "rb") as f:
-            content_b64 = base64.b64encode(f.read()).decode("ascii")
 
-        # Updating an existing file via this API requires its current blob
-        # SHA -- fetch it first. A 404 here just means the file doesn't
-        # exist in the repo yet, so this PUT below will be a create.
-        get_resp = requests.get(url, headers=_github_headers(), params={"ref": GITHUB_BRANCH})
-        sha = get_resp.json().get("sha") if get_resp.status_code == 200 else None
+    with open(local_path, "rb") as f:
+        content_b64 = base64.b64encode(f.read()).decode("ascii")
 
-        payload = {
-            "message": f"data: update {repo_path} [skip ci]",
-            "content": content_b64,
-            "branch": GITHUB_BRANCH,
-        }
-        if sha:
-            payload["sha"] = sha
+    # Use whatever SHA we last saw for this path so most cycles can skip
+    # the GET entirely. If it's stale (someone else touched the file, or
+    # we've never seen it this run) GitHub responds 409/422 and we refetch
+    # once and retry.
+    sha = _github_file_sha_cache.get(repo_path)
 
-        put_resp = requests.put(url, headers=_github_headers(), json=payload)
-        if not put_resp.ok:
-            logger.error(f"GitHub Upload Error ({repo_path}): {put_resp.status_code} {put_resp.text}")
-    except Exception as e:
-        logger.error(f"GitHub Upload Error ({drive_filename}): {e}")
+    for attempt in range(1, GITHUB_MAX_RETRIES + 1):
+        try:
+            if sha is None:
+                # Either never cached, or a previous attempt this call
+                # invalidated it -- fetch fresh. A 404 just means the file
+                # doesn't exist in the repo yet, so the PUT below creates it.
+                get_resp = requests.get(
+                    url, headers=_github_headers(), params={"ref": GITHUB_BRANCH},
+                    timeout=GITHUB_REQUEST_TIMEOUT_SECONDS,
+                )
+                if get_resp.status_code == 200:
+                    sha = get_resp.json().get("sha")
+
+            payload = {
+                "message": f"data: update {repo_path} [skip ci]",
+                "content": content_b64,
+                "branch": GITHUB_BRANCH,
+            }
+            if sha:
+                payload["sha"] = sha
+
+            put_resp = requests.put(
+                url, headers=_github_headers(), json=payload,
+                timeout=GITHUB_REQUEST_TIMEOUT_SECONDS,
+            )
+
+            if put_resp.status_code in (409, 422):
+                # Stale/mismatched SHA -- drop the cache and retry with a
+                # freshly-fetched one instead of failing the whole sync.
+                sha = None
+                _github_file_sha_cache.pop(repo_path, None)
+                if attempt < GITHUB_MAX_RETRIES:
+                    continue
+                logger.error(f"GitHub Upload Error ({repo_path}): {put_resp.status_code} {put_resp.text}")
+                return
+
+            if not put_resp.ok:
+                logger.error(f"GitHub Upload Error ({repo_path}): {put_resp.status_code} {put_resp.text}")
+                return
+
+            new_sha = (put_resp.json().get("content") or {}).get("sha")
+            if new_sha:
+                _github_file_sha_cache[repo_path] = new_sha
+            return  # success
+
+        except requests.exceptions.RequestException as e:
+            if attempt < GITHUB_MAX_RETRIES:
+                backoff = 3 * attempt
+                logger.warning(
+                    f"GitHub Upload attempt {attempt}/{GITHUB_MAX_RETRIES} failed "
+                    f"({repo_path}): {e} — retrying in {backoff}s."
+                )
+                sha = None  # play it safe, refetch on the retry
+                time.sleep(backoff)
+            else:
+                logger.error(
+                    f"GitHub Upload Error ({drive_filename}): giving up after "
+                    f"{GITHUB_MAX_RETRIES} attempts — {e}"
+                )
 
 
 def download_file_from_github(local_path: str, drive_filename: str, folder_name: str) -> bool:
@@ -1023,37 +1104,61 @@ def download_file_from_github(local_path: str, drive_filename: str, folder_name:
 
     Used purely as a FALLBACK in main(): tried only when Drive isn't
     configured, or a Drive restore attempt didn't leave anything usable in
-    local_path (see restore_running_file() below)."""
+    local_path (see restore_running_file() below). Retries on transient
+    connection failures, same as upload_file_to_github()."""
     if not _github_configured():
         return False
     repo_path = get_github_repo_path(folder_name, drive_filename)
     url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPOSITORY}/contents/{repo_path}"
-    try:
-        resp = requests.get(url, headers=_github_headers(), params={"ref": GITHUB_BRANCH})
-        if resp.status_code == 404:
-            logger.info(f"No existing '{repo_path}' on GitHub either — starting fresh.")
-            return False
-        if not resp.ok:
-            logger.error(f"GitHub Download Error ({repo_path}): {resp.status_code} {resp.text}")
-            return False
 
-        content_b64 = resp.json().get("content", "")
-        raw = base64.b64decode(content_b64.encode("ascii")) if content_b64 else b""
-        if not raw:
-            return False
+    for attempt in range(1, GITHUB_MAX_RETRIES + 1):
+        try:
+            resp = requests.get(
+                url, headers=_github_headers(), params={"ref": GITHUB_BRANCH},
+                timeout=GITHUB_REQUEST_TIMEOUT_SECONDS,
+            )
+            if resp.status_code == 404:
+                logger.info(f"No existing '{repo_path}' on GitHub either — starting fresh.")
+                return False
+            if not resp.ok:
+                logger.error(f"GitHub Download Error ({repo_path}): {resp.status_code} {resp.text}")
+                return False
 
-        os.makedirs(os.path.dirname(local_path), exist_ok=True)
-        with open(local_path, "wb") as f:
-            f.write(raw)
+            data = resp.json()
+            content_b64 = data.get("content", "")
+            raw = base64.b64decode(content_b64.encode("ascii")) if content_b64 else b""
+            if not raw:
+                return False
 
-        logger.info(
-            f"Restored '{repo_path}' from GitHub "
-            f"({len(raw)} bytes) — new data will be appended onto it."
-        )
-        return True
-    except Exception as e:
-        logger.error(f"GitHub Download Error ({drive_filename}): {e} — continuing without a GitHub restore.")
-        return False
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            with open(local_path, "wb") as f:
+                f.write(raw)
+
+            sha = data.get("sha")
+            if sha:
+                _github_file_sha_cache[repo_path] = sha
+
+            logger.info(
+                f"Restored '{repo_path}' from GitHub "
+                f"({len(raw)} bytes) — new data will be appended onto it."
+            )
+            return True
+
+        except requests.exceptions.RequestException as e:
+            if attempt < GITHUB_MAX_RETRIES:
+                backoff = 3 * attempt
+                logger.warning(
+                    f"GitHub Download attempt {attempt}/{GITHUB_MAX_RETRIES} failed "
+                    f"({repo_path}): {e} — retrying in {backoff}s."
+                )
+                time.sleep(backoff)
+            else:
+                logger.error(
+                    f"GitHub Download Error ({drive_filename}): giving up after "
+                    f"{GITHUB_MAX_RETRIES} attempts — {e} — continuing without a GitHub restore."
+                )
+                return False
+    return False
 
 
 async def cloud_sync_loop():
@@ -1064,7 +1169,14 @@ async def cloud_sync_loop():
     Drive's 10s) on purpose: each GitHub sync writes up to 3 separate
     commits (one per file, via the Contents API), so a short interval racks
     up commits fast over a long-running job (10s -> tens of thousands of
-    commits over 6h; the default 120s -> a few hundred)."""
+    commits over 6h; the default 120s -> a few hundred). Which files
+    actually go to GitHub is controlled by GITHUB_SYNC_FILES (see its
+    comment near the top of this file).
+
+    The three Drive calls are spaced a second apart rather than fired back
+    to back -- a cheap way to reduce the odds of tripping Drive's
+    userRateLimitExceeded, which is a per-second/per-100-seconds burst
+    limit, not a hard cap on 3 requests every 10s."""
     last_github_sync = 0.0
     while True:
         await asyncio.sleep(10)
@@ -1074,14 +1186,19 @@ async def cloud_sync_loop():
         one_second_path = get_one_second_path(INSTRUMENT_LABEL)
 
         await asyncio.to_thread(upload_file_to_drive, raw_path, RAW_DATA_FILENAME, INSTRUMENT_LABEL)
+        await asyncio.sleep(1)
         await asyncio.to_thread(upload_file_to_drive, level2_path, LEVEL2_FILENAME, INSTRUMENT_LABEL)
+        await asyncio.sleep(1)
         await asyncio.to_thread(upload_file_to_drive, one_second_path, ONE_SECOND_FILENAME, INSTRUMENT_LABEL)
 
         if _github_configured() and (time.time() - last_github_sync) >= GITHUB_SYNC_INTERVAL_SECONDS:
             last_github_sync = time.time()
-            await asyncio.to_thread(upload_file_to_github, raw_path, RAW_DATA_FILENAME, INSTRUMENT_LABEL)
-            await asyncio.to_thread(upload_file_to_github, level2_path, LEVEL2_FILENAME, INSTRUMENT_LABEL)
-            await asyncio.to_thread(upload_file_to_github, one_second_path, ONE_SECOND_FILENAME, INSTRUMENT_LABEL)
+            if "raw" in GITHUB_SYNC_FILES:
+                await asyncio.to_thread(upload_file_to_github, raw_path, RAW_DATA_FILENAME, INSTRUMENT_LABEL)
+            if "level2" in GITHUB_SYNC_FILES:
+                await asyncio.to_thread(upload_file_to_github, level2_path, LEVEL2_FILENAME, INSTRUMENT_LABEL)
+            if "1s" in GITHUB_SYNC_FILES:
+                await asyncio.to_thread(upload_file_to_github, one_second_path, ONE_SECOND_FILENAME, INSTRUMENT_LABEL)
 
 
 # =========================================================
