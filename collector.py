@@ -3,6 +3,7 @@ import sys
 import time
 import json
 import io
+import base64
 import logging
 import asyncio
 from datetime import datetime
@@ -81,6 +82,28 @@ FYERS_ACCESS_TOKEN_ENV = os.environ.get("FYERS_ACCESS_TOKEN")
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
 GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN")
+
+# --- GitHub (a second, independent backup + fallback restore source used
+# whenever Google Drive isn't configured or doesn't have anything to
+# restore) ---
+# GITHUB_TOKEN must be passed in explicitly from secrets.GITHUB_TOKEN (or a
+# PAT) -- Actions does NOT expose it to run steps automatically. The job
+# also needs `permissions: contents: write` for GITHUB_TOKEN to be allowed
+# to push commits.
+# GITHUB_REPOSITORY and GITHUB_REF_NAME are already set automatically by
+# the Actions runner for every job (no need to add them to the workflow's
+# env: block), but are read from the environment here too so the script
+# still works unmodified outside Actions if you export them yourself.
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY")  # "owner/repo"
+GITHUB_BRANCH = os.environ.get("GITHUB_DATA_BRANCH") or os.environ.get("GITHUB_REF_NAME") or "main"
+GITHUB_API_BASE = "https://api.github.com"
+# How often (seconds) to push a GitHub backup commit. Kept much longer than
+# the 10s Drive cadence on purpose -- each sync writes up to 3 separate
+# commits (one per file) via the Contents API, so a short interval racks up
+# commits fast over a long run (e.g. 10s -> tens of thousands of commits
+# over 6h; 120s -> a few hundred).
+GITHUB_SYNC_INTERVAL_SECONDS = int(os.environ.get("GITHUB_SYNC_INTERVAL_SECONDS", "120"))
 
 TOKEN_CACHE_PATH = "fyers_token_cache.json"
 
@@ -877,14 +900,14 @@ def upload_file_to_drive(local_path: str, drive_filename: str, folder_name: str)
         logger.error(f"Google Drive Upload Error ({drive_filename}): {e}")
 
 
-def download_file_from_drive(local_path: str, drive_filename: str, folder_name: str):
+def download_file_from_drive(local_path: str, drive_filename: str, folder_name: str) -> bool:
     """Seeds local_path with whatever is currently on Drive for
     `drive_filename` inside `folder_name`, BEFORE any new data is written
     this run.
 
     Why this exists: this job typically restarts on an ephemeral filesystem
     (fresh container), so local_path starts empty every run. Without this,
-    the first google_drive_sync_loop() cycle would call upload_file_to_drive(),
+    the first cloud_sync_loop() cycle would call upload_file_to_drive(),
     which does an in-place Drive *replace* — overwriting all of yesterday's
     (or this morning's) accumulated history with just the handful of rows
     written since restart. Downloading first means local_path already
@@ -896,9 +919,13 @@ def download_file_from_drive(local_path: str, drive_filename: str, folder_name: 
     exists there yet (first-ever run), or on any error — so a transient
     Drive hiccup at startup degrades to "start fresh locally" rather than
     crashing the job.
-    """
+
+    Returns True only when it actually restored real bytes into local_path,
+    and False in every other case (not configured, nothing on Drive yet, or
+    an error). main() uses this to decide whether to additionally fall back
+    to restoring from GitHub (see download_file_from_github())."""
     if not all([GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN]):
-        return
+        return False
     try:
         service = _get_drive_service()
         parent_id = get_or_create_drive_folder(service, folder_name)
@@ -908,7 +935,7 @@ def download_file_from_drive(local_path: str, drive_filename: str, folder_name: 
         files = results.get("files", [])
         if not files:
             logger.info(f"No existing '{drive_filename}' on Drive under '{folder_name}' — starting fresh.")
-            return
+            return False
 
         os.makedirs(os.path.dirname(local_path), exist_ok=True)
         request = service.files().get_media(fileId=files[0]["id"])
@@ -922,28 +949,139 @@ def download_file_from_drive(local_path: str, drive_filename: str, folder_name: 
             f"Restored '{drive_filename}' from Drive "
             f"({os.path.getsize(local_path)} bytes) — new data will be appended onto it."
         )
+        return os.path.exists(local_path) and os.path.getsize(local_path) > 0
     except Exception as e:
         logger.error(
             f"Google Drive Download Error ({drive_filename}): {e} — "
             "continuing with a fresh local file for this run."
         )
+        return False
 
 
-async def google_drive_sync_loop():
-    """Syncs all three running files per cycle, all inside the same Drive
-    folder named after the instrument (e.g. "tcs/RawData.csv",
-    "tcs/Level2.csv" and "tcs/1Second_tcs.csv")."""
+# --- GitHub helpers (second, independent backup + fallback restore source) ---
+def _github_configured() -> bool:
+    return bool(GITHUB_TOKEN and GITHUB_REPOSITORY)
+
+
+def _github_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def get_github_repo_path(folder_name: str, filename: str) -> str:
+    """Path inside the repo a given local file is mirrored to/from --
+    mirrors the local `data/<folder_name>/<filename>` layout exactly."""
+    return f"data/{folder_name}/{filename}"
+
+
+def upload_file_to_github(local_path: str, drive_filename: str, folder_name: str):
+    """Commits local_path's current content to
+    data/<folder_name>/<drive_filename> in the repo, via the Contents API.
+
+    This is an ADDITIONAL backup that runs alongside Google Drive, not a
+    replacement for it -- it fires regardless of whether the Drive upload
+    in this same cycle succeeded, so GitHub ends up with its own
+    independent copy of the data, living in the repo's commit history.
+    Requires GITHUB_TOKEN (with `contents: write` permission on the repo)
+    and GITHUB_REPOSITORY to be set; no-ops silently otherwise, same
+    pattern as upload_file_to_drive()."""
+    if not os.path.exists(local_path) or not _github_configured():
+        return
+    repo_path = get_github_repo_path(folder_name, drive_filename)
+    url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPOSITORY}/contents/{repo_path}"
+    try:
+        with open(local_path, "rb") as f:
+            content_b64 = base64.b64encode(f.read()).decode("ascii")
+
+        # Updating an existing file via this API requires its current blob
+        # SHA -- fetch it first. A 404 here just means the file doesn't
+        # exist in the repo yet, so this PUT below will be a create.
+        get_resp = requests.get(url, headers=_github_headers(), params={"ref": GITHUB_BRANCH})
+        sha = get_resp.json().get("sha") if get_resp.status_code == 200 else None
+
+        payload = {
+            "message": f"data: update {repo_path} [skip ci]",
+            "content": content_b64,
+            "branch": GITHUB_BRANCH,
+        }
+        if sha:
+            payload["sha"] = sha
+
+        put_resp = requests.put(url, headers=_github_headers(), json=payload)
+        if not put_resp.ok:
+            logger.error(f"GitHub Upload Error ({repo_path}): {put_resp.status_code} {put_resp.text}")
+    except Exception as e:
+        logger.error(f"GitHub Upload Error ({drive_filename}): {e}")
+
+
+def download_file_from_github(local_path: str, drive_filename: str, folder_name: str) -> bool:
+    """Restores local_path from data/<folder_name>/<drive_filename> in the
+    repo. Returns True only if it actually wrote real data into local_path.
+
+    Used purely as a FALLBACK in main(): tried only when Drive isn't
+    configured, or a Drive restore attempt didn't leave anything usable in
+    local_path (see restore_running_file() below)."""
+    if not _github_configured():
+        return False
+    repo_path = get_github_repo_path(folder_name, drive_filename)
+    url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPOSITORY}/contents/{repo_path}"
+    try:
+        resp = requests.get(url, headers=_github_headers(), params={"ref": GITHUB_BRANCH})
+        if resp.status_code == 404:
+            logger.info(f"No existing '{repo_path}' on GitHub either — starting fresh.")
+            return False
+        if not resp.ok:
+            logger.error(f"GitHub Download Error ({repo_path}): {resp.status_code} {resp.text}")
+            return False
+
+        content_b64 = resp.json().get("content", "")
+        raw = base64.b64decode(content_b64.encode("ascii")) if content_b64 else b""
+        if not raw:
+            return False
+
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        with open(local_path, "wb") as f:
+            f.write(raw)
+
+        logger.info(
+            f"Restored '{repo_path}' from GitHub "
+            f"({len(raw)} bytes) — new data will be appended onto it."
+        )
+        return True
+    except Exception as e:
+        logger.error(f"GitHub Download Error ({drive_filename}): {e} — continuing without a GitHub restore.")
+        return False
+
+
+async def cloud_sync_loop():
+    """Syncs all three running files per cycle to Google Drive (every 10s,
+    same as before) AND, as an independent second backup, to GitHub.
+
+    GitHub is throttled to GITHUB_SYNC_INTERVAL_SECONDS (much longer than
+    Drive's 10s) on purpose: each GitHub sync writes up to 3 separate
+    commits (one per file, via the Contents API), so a short interval racks
+    up commits fast over a long-running job (10s -> tens of thousands of
+    commits over 6h; the default 120s -> a few hundred)."""
+    last_github_sync = 0.0
     while True:
         await asyncio.sleep(10)
 
         raw_path = get_raw_data_path(INSTRUMENT_LABEL)
-        await asyncio.to_thread(upload_file_to_drive, raw_path, RAW_DATA_FILENAME, INSTRUMENT_LABEL)
-
         level2_path = get_level2_path(INSTRUMENT_LABEL)
-        await asyncio.to_thread(upload_file_to_drive, level2_path, LEVEL2_FILENAME, INSTRUMENT_LABEL)
-
         one_second_path = get_one_second_path(INSTRUMENT_LABEL)
+
+        await asyncio.to_thread(upload_file_to_drive, raw_path, RAW_DATA_FILENAME, INSTRUMENT_LABEL)
+        await asyncio.to_thread(upload_file_to_drive, level2_path, LEVEL2_FILENAME, INSTRUMENT_LABEL)
         await asyncio.to_thread(upload_file_to_drive, one_second_path, ONE_SECOND_FILENAME, INSTRUMENT_LABEL)
+
+        if _github_configured() and (time.time() - last_github_sync) >= GITHUB_SYNC_INTERVAL_SECONDS:
+            last_github_sync = time.time()
+            await asyncio.to_thread(upload_file_to_github, raw_path, RAW_DATA_FILENAME, INSTRUMENT_LABEL)
+            await asyncio.to_thread(upload_file_to_github, level2_path, LEVEL2_FILENAME, INSTRUMENT_LABEL)
+            await asyncio.to_thread(upload_file_to_github, one_second_path, ONE_SECOND_FILENAME, INSTRUMENT_LABEL)
 
 
 # =========================================================
@@ -1165,7 +1303,7 @@ async def run_websocket_with_retry():
             backoff = 5  # reset after a successful connect
             consecutive_failures = 0
             # The SDK's own thread drives the socket; just idle here and
-            # let google_drive_sync_loop keep running.
+            # let cloud_sync_loop keep running.
             while True:
                 await asyncio.sleep(30)
         except Exception as e:
@@ -1189,27 +1327,41 @@ async def main():
     logger.info(f"Starting real-time L1+L2+1s collection for {FYERS_SYMBOL} "
                 f"(depth source: {FYERS_DEPTH_SOURCE})...")
 
-    # Restore prior data from Drive BEFORE anything writes locally. This is
-    # the fix for the "overwrites previous data" problem: if this run's
-    # local RawData.csv/Level2.csv/1Second_tcs.csv start empty (fresh
-    # container) and we skip this step, the first google_drive_sync_loop()
-    # upload replaces Drive's accumulated file with an almost-empty one.
-    # Pulling the existing Drive copy down first means local writes append
-    # onto the full history, so it keeps combining across restarts instead
-    # of resetting. Only restores when the local file is missing/empty, so
-    # it never clobbers a local file that already has this run's data (e.g.
-    # on a non-ephemeral host where local state survived a restart).
+    # Restore prior data BEFORE anything writes locally. This is the fix for
+    # the "overwrites previous data" problem: if this run's local
+    # RawData.csv/Level2.csv/1Second_tcs.csv start empty (fresh container)
+    # and we skip this step, the first cloud_sync_loop() upload replaces
+    # Drive's accumulated file with an almost-empty one.
+    #
+    # Google Drive is tried first, same as before. If Drive isn't configured
+    # (no GOOGLE_* secrets) or a Drive restore didn't actually produce data
+    # for a given file (e.g. Drive is down, or that file was never uploaded
+    # there), GitHub is tried next as a fallback restore source, reading
+    # back whatever cloud_sync_loop() most recently committed there.
+    #
+    # Pulling existing data down first means local writes append onto the
+    # full history, so it keeps combining across restarts instead of
+    # resetting. Only restores when the local file is missing/empty, so it
+    # never clobbers a local file that already has this run's data (e.g. on
+    # a non-ephemeral host where local state survived a restart).
+    async def restore_running_file(local_path: str, filename: str):
+        if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+            return
+        restored = False
+        if all([GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN]):
+            restored = await asyncio.to_thread(download_file_from_drive, local_path, filename, INSTRUMENT_LABEL)
+        if not restored and _github_configured():
+            logger.info(f"Drive didn't restore '{filename}' — falling back to GitHub.")
+            await asyncio.to_thread(download_file_from_github, local_path, filename, INSTRUMENT_LABEL)
+
     raw_path = get_raw_data_path(INSTRUMENT_LABEL)
     level2_path = get_level2_path(INSTRUMENT_LABEL)
     one_second_path = get_one_second_path(INSTRUMENT_LABEL)
-    if not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
-        await asyncio.to_thread(download_file_from_drive, raw_path, RAW_DATA_FILENAME, INSTRUMENT_LABEL)
-    if not os.path.exists(level2_path) or os.path.getsize(level2_path) == 0:
-        await asyncio.to_thread(download_file_from_drive, level2_path, LEVEL2_FILENAME, INSTRUMENT_LABEL)
-    if not os.path.exists(one_second_path) or os.path.getsize(one_second_path) == 0:
-        await asyncio.to_thread(download_file_from_drive, one_second_path, ONE_SECOND_FILENAME, INSTRUMENT_LABEL)
+    await restore_running_file(raw_path, RAW_DATA_FILENAME)
+    await restore_running_file(level2_path, LEVEL2_FILENAME)
+    await restore_running_file(one_second_path, ONE_SECOND_FILENAME)
 
-    tasks = [run_websocket_with_retry(), google_drive_sync_loop(), one_second_timer_loop()]
+    tasks = [run_websocket_with_retry(), cloud_sync_loop(), one_second_timer_loop()]
     if FYERS_DEPTH_SOURCE == "tbt":
         tasks.append(run_tbt_depth_with_retry())
 
