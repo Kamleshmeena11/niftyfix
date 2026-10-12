@@ -17,9 +17,7 @@ import websockets  # needed only when FYERS_DEPTH_SOURCE=tbt
 from fyers_apiv3 import fyersModel
 from fyers_apiv3.FyersWebsocket import data_ws
 
-# TBT (Versova) protobuf schema — generated from Fyers' official msg.proto,
-# only needed when FYERS_DEPTH_SOURCE=tbt. Ship msg_pb2.py alongside this
-# file (see accompanying msg.proto / build instructions).
+# TBT (Versova) protobuf schema — only needed when FYERS_DEPTH_SOURCE=tbt.
 try:
     import msg_pb2 as fyers_tbt_pb2
 except ImportError:
@@ -41,23 +39,20 @@ logger = logging.getLogger(__name__)
 
 IST = ZoneInfo("Asia/Kolkata")
 
-# --- Fyers app credentials (from your Fyers API app) ---
+
+def _env_bool(name: str, default: str) -> bool:
+    return os.environ.get(name, default).strip().lower() not in ("0", "false", "no")
+
+
+# --- Fyers app credentials ---
 def _normalize_app_id(raw: str, app_type: str) -> str:
-    """
-    Accepts either the bare app id ('XY0W1234') or the full client-id
-    format ('XY0W1234-100') for FYERS_APP_ID and always returns the bare
-    app id — the '-<app_type>' suffix is appended back on wherever a full
-    client_id is actually needed. Makes the script work regardless of
-    which format was pasted into the secret.
-    """
+    """Accepts 'XY0W1234' or 'XY0W1234-100' and returns the bare app id."""
     if not raw:
         return raw
     raw = raw.strip()
     suffix = f"-{app_type}"
     if raw.endswith(suffix):
         return raw[: -len(suffix)]
-    # Also handle a stray "-<anything>" suffix in case FYERS_APP_TYPE
-    # itself doesn't match what's embedded in the id.
     if "-" in raw:
         head, _, tail = raw.rpartition("-")
         if tail.isdigit():
@@ -71,10 +66,10 @@ FYERS_APP_TYPE = _RAW_APP_TYPE
 FYERS_SECRET_KEY = os.environ.get("FYERS_SECRET_KEY")
 FYERS_REDIRECT_URI = os.environ.get("FYERS_REDIRECT_URI")
 
-# --- Fyers login credentials (used ONLY for automatic TOTP-based token generation) ---
-FYERS_FY_ID = os.environ.get("FYERS_FY_ID")            # Your Fyers client ID, e.g. "XY01234"
-FYERS_TOTP_SECRET = os.environ.get("FYERS_TOTP_SECRET")  # Base32 TOTP secret from Fyers 2FA setup
-FYERS_PIN = os.environ.get("FYERS_PIN")                 # 4-digit trading PIN
+# --- Fyers login credentials (automatic TOTP-based token generation) ---
+FYERS_FY_ID = os.environ.get("FYERS_FY_ID")
+FYERS_TOTP_SECRET = os.environ.get("FYERS_TOTP_SECRET")
+FYERS_PIN = os.environ.get("FYERS_PIN")
 
 # Optional: a manually-supplied token as a fallback / override
 FYERS_ACCESS_TOKEN_ENV = os.environ.get("FYERS_ACCESS_TOKEN")
@@ -83,132 +78,110 @@ GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
 GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN")
 
-# --- GitHub (a second, independent backup + fallback restore source used
-# whenever Google Drive isn't configured or doesn't have anything to
-# restore) ---
-# GITHUB_TOKEN must be passed in explicitly from secrets.GITHUB_TOKEN (or a
-# PAT) -- Actions does NOT expose it to run steps automatically. The job
-# also needs `permissions: contents: write` for GITHUB_TOKEN to be allowed
-# to push commits.
-# GITHUB_REPOSITORY and GITHUB_REF_NAME are already set automatically by
-# the Actions runner for every job (no need to add them to the workflow's
-# env: block), but are read from the environment here too so the script
-# still works unmodified outside Actions if you export them yourself.
+# --- GitHub (second, independent backup + fallback restore source) ---
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY")  # "owner/repo"
 GITHUB_BRANCH = os.environ.get("GITHUB_DATA_BRANCH") or os.environ.get("GITHUB_REF_NAME") or "main"
 GITHUB_API_BASE = "https://api.github.com"
-# How often (seconds) to push a GitHub backup commit. Kept much longer than
-# the 10s Drive cadence on purpose -- each sync writes up to 3 separate
-# commits (one per file) via the Contents API, so a short interval racks up
-# commits fast over a long run (e.g. 10s -> tens of thousands of commits
-# over 6h; 120s -> a few hundred).
 GITHUB_SYNC_INTERVAL_SECONDS = int(os.environ.get("GITHUB_SYNC_INTERVAL_SECONDS", "120"))
-# Which running files actually get pushed to GitHub, as a comma-separated
-# subset of {"raw", "level2", "1s"}. Defaults to all three. RawData.csv and
-# Level2.csv are per-tick data and grow throughout the session -- each sync
-# re-uploads the file's ENTIRE current content (same "replace the whole
-# file" approach as Drive), so on an active symbol they can reach several
-# MB well before the session ends, and large single-request payloads are
-# more likely to hit transient connection drops. If GitHub uploads for
-# those two keep failing, narrow this down, e.g. GITHUB_SYNC_FILES=1s to
-# only back up the (small, slow-growing) 1-second bars to GitHub and lean
-# on Drive + the workflow's end-of-run artifact upload for the raw files.
+# Which running files get pushed to GitHub. Keys:
+#   TCS:        raw, level2, 1s
+#   Bank Nifty: bn_raw, bn_1s   (OFF by default — BN tick files get large;
+#                                Drive + the end-of-run artifact are better for those)
 GITHUB_SYNC_FILES = {
     f.strip().lower()
     for f in os.environ.get("GITHUB_SYNC_FILES", "raw,level2,1s").split(",")
     if f.strip()
 }
-# Per-request timeout (seconds) for GitHub API calls, and how many times to
-# retry a call that fails with a transient network/connection error (e.g.
-# the SSLEOFError / connection-reset errors GitHub Actions runners
-# occasionally hit on larger uploads).
 GITHUB_REQUEST_TIMEOUT_SECONDS = int(os.environ.get("GITHUB_REQUEST_TIMEOUT_SECONDS", "60"))
 GITHUB_MAX_RETRIES = int(os.environ.get("GITHUB_MAX_RETRIES", "3"))
 
 TOKEN_CACHE_PATH = "fyers_token_cache.json"
 
-# --- Instrument (single symbol, Level 1 + Level 2) ---
-FYERS_SYMBOL = os.environ.get("FYERS_SYMBOL", "NSE:TCS-EQ")
-INSTRUMENT_LABEL = "tcs"
-# NOTE ON DEPTH: how many levels/side you actually receive from Fyers'
-# "DepthUpdate" feed depends on the instrument/segment and your Fyers plan
-# -- some feeds send back more than the old 5-level assumption. This script
-# just requests/accepts up to DOM_LEVELS per side; extract_depth_levels()
-# slices to that cap, so if Fyers sends fewer levels for a given symbol you
-# simply get fewer, and if it sends more you now capture up to 50.
+# =========================================================
+# --- Instruments ---
+# =========================================================
+# 1) TCS (equity cash): Level 1 + Level 2 + 1-second bars  (UNCHANGED behavior)
+# 2) Bank Nifty futures: Level 1 raw ticks only (RawData.csv), optional 1s bars
+#
+# Bank Nifty futures symbol format: NSE:BANKNIFTY<YY><MON>FUT, e.g.
+# NSE:BANKNIFTY26OCTFUT. Contracts are monthly — UPDATE FYERS_BANKNIFTY_SYMBOL
+# AT EACH EXPIRY ROLLOVER (verify the exact symbol in Fyers' symbol master).
+TCS_SYMBOL = os.environ.get("FYERS_SYMBOL", "NSE:TCS-EQ")
+TCS_LABEL = "tcs"
+FYERS_SYMBOL = TCS_SYMBOL            # kept for backward compatibility
+INSTRUMENT_LABEL = TCS_LABEL         # kept for backward compatibility
+
+BN_ENABLED = _env_bool("FYERS_BANKNIFTY_ENABLED", "true")
+BN_SYMBOL = os.environ.get("FYERS_BANKNIFTY_SYMBOL", "NSE:BANKNIFTY26OCTFUT")
+BN_LABEL = os.environ.get("FYERS_BANKNIFTY_LABEL", "banknifty")
+# Optional 1-second OHLCV bars for Bank Nifty (off by default: you asked for raw ticks).
+BN_ONE_SECOND = _env_bool("FYERS_BANKNIFTY_1S", "false")
+# Futures vol_traded_today is in UNITS (1 lot = lot-size units). Splitting into
+# 1-volume rows would write dozens of rows per lot, so this defaults to false.
+BN_SPLIT_PRINTS = _env_bool("FYERS_BANKNIFTY_SPLIT_PRINTS", "false")
+
+# NOTE ON DEPTH: number of levels/side requested for TCS. extract_depth_levels()
+# slices to this cap; fewer levels from Fyers just means fewer lines.
 DOM_LEVELS = int(os.environ.get("FYERS_DOM_LEVELS", "50"))
 
-# --- Depth source selection ---
-# "standard" (default): the existing data_ws DepthUpdate feed used below.
-# For equity cash symbols (like NSE:TCS-EQ) Fyers only ever sends a handful
-# of levels (5, occasionally a bit more) on this feed regardless of what
-# DOM_LEVELS is set to — there is no server-side way to ask for more.
-#
-# "tbt": Fyers' separate Tick-By-Tick / "Versova" protobuf WebSocket, which
-# is the ONLY Fyers feed that actually carries up to 50 depth levels.
-# IMPORTANT CAVEAT (confirmed from Fyers' own docs/community as of writing):
-# TBT is currently available for NFO (NSE F&O) instruments only — NOT for
-# NSE cash-market equities such as NSE:TCS-EQ. If you point this at an
-# equity symbol, expect either no data or a connection/auth rejection.
-# If you need 50-level depth on TCS specifically, you'd need to trade the
-# TCS futures contract's symbol instead, or confirm with Fyers support
-# whether NSECM TBT has since been enabled for your account.
+# --- Depth source selection (applies to TCS only) ---
+# "standard" (default): data_ws DepthUpdate feed.
+# "tbt": Fyers TBT/Versova protobuf WebSocket (currently NFO-only per Fyers docs,
+# so it will NOT work for NSE:TCS-EQ).
 FYERS_DEPTH_SOURCE = os.environ.get("FYERS_DEPTH_SOURCE", "standard").strip().lower()
 FYERS_TBT_WS_URL = os.environ.get("FYERS_TBT_WS_URL", "wss://rtsocket-api.fyers.in/versova")
 
-# Temporary debug aid: log the first N raw DepthUpdate messages, completely
-# unparsed, so you can see exactly what fields/levels Fyers is actually
-# sending (rather than trusting what extract_depth_levels() picked out).
-# Set to 0 to disable. Safe to leave on briefly, then turn back off --
-# it only fires a bounded number of times, not on every message.
+# Temporary debug aid: log the first N raw DepthUpdate messages.
 FYERS_DEBUG_RAW_DEPTH_MESSAGES = int(os.environ.get("FYERS_DEBUG_RAW_DEPTH_MESSAGES", "5"))
 _raw_depth_debug_count = 0
 
-# Optional: split each trade print into N separate 1-volume lines, matching
-# the C# indicator's "Split multi-lot prints into 1-lot lines (matches NT8
-# 1-Volume series)" behavior. On by default, like the C# script.
-FYERS_SPLIT_PRINTS = os.environ.get("FYERS_SPLIT_PRINTS", "true").strip().lower() not in ("0", "false", "no")
+# TCS: split each trade print into N separate 1-volume lines (matches NT8 1-Volume series).
+FYERS_SPLIT_PRINTS = _env_bool("FYERS_SPLIT_PRINTS", "true")
 
-# NEW: also write an explicit "L1;{side};{date};{frac};{price};{size}"
-# execution-tag line into Level2.csv for every trade print, alongside the
-# existing "L2;..." depth-diff lines — exactly the combined-file pattern
-# used by UltraLinkQuantowerBridge_GDrive.cs (its L1L2.csv interleaves
-# "L1;" trade lines and "L2;" depth lines). Previously this script only
-# wrote untagged rows to RawData.csv, so nothing downstream had an
-# explicit buy/sell tag to key off of; anything inferring side from
-# comparing Price to the Bid/Ask columns would misclassify trades whenever
-# best_bid/best_ask hadn't been established yet (see the depth-handling
-# fix below), which is why only "buy side" executions were showing up.
-# side 0 = traded at/through the ask (buy aggressor), 1 = traded at/through
-# the bid (sell aggressor), same convention as the "L1;" lines in the C#
-# reference and the "L2;" side field already used below.
-FYERS_WRITE_L1_TAG_LINES = os.environ.get("FYERS_WRITE_L1_TAG_LINES", "true").strip().lower() not in ("0", "false", "no")
+# TCS: also write explicit "L1;{side};..." execution-tag lines into Level2.csv.
+FYERS_WRITE_L1_TAG_LINES = _env_bool("FYERS_WRITE_L1_TAG_LINES", "true")
 
 BASE_DATA_DIR = "data"
 
-# Local + Drive layout: ONE folder per instrument (e.g. "tcs"), containing
-# exactly three running files — RawData.csv (L1 tape), Level2.csv (L2 DOM
-# diffs, now also carrying the "L1;" execution-tag lines described above),
-# and 1Second_tcs.csv (1-second OHLCV bars built from the same trade prints
-# as RawData.csv). No daily sub-folders, no duplicate daily/combined pairs,
-# and no per-second bucketing of Level2 data.
+# Layout: ONE folder per instrument.
+#   data/tcs/RawData.csv, data/tcs/Level2.csv, data/tcs/1Second_tcs.csv
+#   data/banknifty/RawData.csv  (+ 1Second_banknifty.csv if enabled)
 RAW_DATA_FILENAME = "RawData.csv"
 LEVEL2_FILENAME = "Level2.csv"
-ONE_SECOND_FILENAME = "1Second_tcs.csv"
+ONE_SECOND_FILENAME = "1Second_tcs.csv"          # TCS (unchanged name)
+BN_ONE_SECOND_FILENAME = f"1Second_{BN_LABEL}.csv"
 
-# Header row written once at the top of a brand-new RawData.csv.
 RAW_DATA_HEADER = "Timestamp;Price;Bid;Ask;Volume"
-
-# Header row written once at the top of a brand-new 1Second_tcs.csv.
 ONE_SECOND_HEADER = "timestamp,instrument_key,open,high,low,close,volume"
 
-# How many seconds we hold a 1-second bucket open after its second has
-# technically elapsed, before finalizing/writing it -- gives slightly
-# late-arriving trade prints (still stamped with the correct trade second)
-# time to land in the right bucket before it's flushed. Same idea as the
-# BUFFER_SECONDS used in the Upstox 1s collector this was ported from.
 ONE_SECOND_BUFFER_SECONDS = int(os.environ.get("FYERS_1S_BUFFER_SECONDS", "2"))
+
+# Drive sync cadence (seconds). Each sync re-uploads the whole file, and the
+# Bank Nifty tick file grows much faster than TCS, so it syncs less often.
+DRIVE_SYNC_INTERVAL_SECONDS = int(os.environ.get("DRIVE_SYNC_INTERVAL_SECONDS", "10"))
+BN_DRIVE_SYNC_INTERVAL_SECONDS = int(os.environ.get("BN_DRIVE_SYNC_INTERVAL_SECONDS", "30"))
+
+# Per-instrument config, keyed by Fyers symbol.
+INSTRUMENTS = {
+    TCS_SYMBOL: {
+        "label": TCS_LABEL,
+        "depth": True,                       # Level 2 enabled
+        "l1_tags": FYERS_WRITE_L1_TAG_LINES,
+        "split": FYERS_SPLIT_PRINTS,
+        "one_second": True,
+        "one_second_filename": ONE_SECOND_FILENAME,
+    },
+}
+if BN_ENABLED:
+    INSTRUMENTS[BN_SYMBOL] = {
+        "label": BN_LABEL,
+        "depth": False,                      # Level 1 only
+        "l1_tags": False,                    # no Level2.csv for Bank Nifty
+        "split": BN_SPLIT_PRINTS,
+        "one_second": BN_ONE_SECOND,
+        "one_second_filename": BN_ONE_SECOND_FILENAME,
+    }
 
 
 # =========================================================
@@ -241,11 +214,7 @@ def _save_token_cache(access_token: str):
 
 
 def generate_access_token_via_totp() -> str:
-    """
-    Fully automated Fyers login using client ID + TOTP secret + PIN.
-    Requires FYERS_FY_ID, FYERS_TOTP_SECRET, FYERS_PIN, FYERS_APP_ID,
-    FYERS_SECRET_KEY and FYERS_REDIRECT_URI to be set.
-    """
+    """Fully automated Fyers login using client ID + TOTP secret + PIN."""
     required = {
         "FYERS_FY_ID": FYERS_FY_ID,
         "FYERS_TOTP_SECRET": FYERS_TOTP_SECRET,
@@ -281,7 +250,7 @@ def generate_access_token_via_totp() -> str:
             raise RuntimeError(f"{step_name} failed ({resp.status_code}): {resp.text}")
         return resp
 
-    # Step 1: send login OTP request for the client id
+    # Step 1: send login OTP request
     r1 = _post(f"{base}/send_login_otp", {"fy_id": FYERS_FY_ID, "app_id": "2"}, "send_login_otp")
     request_key = r1.json()["request_key"]
 
@@ -290,7 +259,7 @@ def generate_access_token_via_totp() -> str:
     r2 = _post(f"{base}/verify_otp", {"request_key": request_key, "otp": totp_code}, "verify_otp")
     request_key_2 = r2.json()["request_key"]
 
-    # Step 3: verify PIN, get an internal session token
+    # Step 3: verify PIN
     r3 = _post(f"{base}/verify_pin", {
         "request_key": request_key_2,
         "identity_type": "pin",
@@ -298,7 +267,7 @@ def generate_access_token_via_totp() -> str:
     }, "verify_pin")
     internal_token = r3.json()["data"]["access_token"]
 
-    # Step 4: exchange internal session token for an auth_code against your app
+    # Step 4: exchange internal session token for an auth_code
     headers = {"Authorization": f"Bearer {internal_token}"}
     token_payload = {
         "fyers_id": FYERS_FY_ID,
@@ -312,10 +281,8 @@ def generate_access_token_via_totp() -> str:
         "response_type": "code",
         "create_cookie": True
     }
-    # IMPORTANT: this endpoint returns HTTP 308 on success with the
-    # redirect URL in the JSON body — it must NOT be auto-followed,
-    # or requests silently POSTs to redirect_uri instead and you get
-    # an unrelated 400 back from that page.
+    # This endpoint returns HTTP 308 on success with the redirect URL in the
+    # JSON body — it must NOT be auto-followed.
     r4 = session.post(
         "https://api-t2.fyers.in/api/v3/token",
         json=token_payload,
@@ -388,34 +355,22 @@ def get_valid_access_token() -> str:
     logger.info("No valid token found — generating a new one automatically.")
     return generate_access_token_via_totp()
 
+
 # =========================================================
-# --- L1/L2 output (RawData.csv: Timestamp;Price;Bid;Ask;Volume)
-# --- (Level2.csv format matches UltraLinkQuantowerBridge_GDrive.cs's
-# ---  combined L1L2.csv: "L1;" execution-tag lines interleaved with
-# ---  "L2;" depth-diff lines) ---
+# --- L1/L2 output ---
 # =========================================================
-#
-#   L1 line:  L1;{side};{yyyyMMddHHmmss};{ffffff};{price};{size}
+#   RawData.csv : Timestamp;Price;Bid;Ask;Volume  (one row per trade/tick)
+#   L1 line:  L1;{side};{yyyyMMddHHmmss};{ffffff};{price};{size}      (TCS Level2.csv)
 #   L2 line:  L2;{side};{yyyyMMddHHmmss};{ffffff};{op};{level};;{price};{size}
 #
 #   side  : 0 = ask/offer side, 1 = bid side
-#           (for L1 this is the trade's aggressor side: 0 if traded
-#           at/through the ask (buy execution), 1 if traded at/through the
-#           bid (sell execution), else carried over from the previous trade)
+#           (for L1: trade aggressor side — 0 = at/through ask, 1 = at/through bid)
 #   op    : 0 = level inserted/changed, 2 = level dropped (size forced to 0)
 #   level : 0-based depth index on that side, 0 = best price
 #
-# RawData.csv gets one header row ("Timestamp;Price;Bid;Ask;Volume") the
-# first time the file is created, then one data row per trade: the trade
-# timestamp, the trade price, and the best bid/ask in force *at that
-# moment*, plus the trade's volume.
-#
 # NOTE ON TIMESTAMP PRECISION: Fyers' feed only gives trade time (ltt) to
-# 1-second resolution and doesn't expose exchange-side sub-second ticks the
-# way the raw NT8 tape does. The 7-digit fraction here is filled from local
-# receipt-time microseconds (scaled x10 to approximate .NET's 100ns "tick"
-# fraction) so lines stay strictly orderable and match the expected 7-digit
-# width — it is NOT the exchange's true tick timestamp.
+# 1-second resolution. The sub-second fraction is filled from local
+# receipt-time microseconds — it is NOT the exchange's true tick timestamp.
 
 def get_raw_data_path(label: str) -> str:
     return os.path.join(BASE_DATA_DIR, label, RAW_DATA_FILENAME)
@@ -425,8 +380,8 @@ def get_level2_path(label: str) -> str:
     return os.path.join(BASE_DATA_DIR, label, LEVEL2_FILENAME)
 
 
-def get_one_second_path(label: str) -> str:
-    return os.path.join(BASE_DATA_DIR, label, ONE_SECOND_FILENAME)
+def get_one_second_path(label: str, filename: str = None) -> str:
+    return os.path.join(BASE_DATA_DIR, label, filename or ONE_SECOND_FILENAME)
 
 
 def append_pipe_line(path: str, line: str):
@@ -436,8 +391,7 @@ def append_pipe_line(path: str, line: str):
 
 
 def write_l1_line(label: str, line: str):
-    """Appends one data row to <label>/RawData.csv, writing the
-    'Timestamp;Price;Bid;Ask;Volume' header first if the file is new."""
+    """Appends one data row to <label>/RawData.csv, writing the header first if new."""
     path = get_raw_data_path(label)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     is_new_file = not os.path.exists(path) or os.path.getsize(path) == 0
@@ -453,8 +407,7 @@ def write_l2_line(label: str, line: str):
 
 
 def fmt_num(x) -> str:
-    """Match C#'s double.ToString(InvariantCulture): plain decimal, no
-    trailing '.0' for whole numbers, no scientific notation."""
+    """Match C#'s double.ToString(InvariantCulture): no trailing '.0', no sci notation."""
     if x is None:
         return "0"
     try:
@@ -468,18 +421,12 @@ def fmt_num(x) -> str:
 
 
 def fmt_bar_num(x) -> str:
-    """Plain float-to-string formatting for 1Second_tcs.csv, e.g.
-    0.0 -> '0.0', 57941.5 -> '57941.5'. Deliberately NOT fmt_num() --
-    the target format keeps a trailing '.0' for whole numbers (matching
-    the sample file), whereas fmt_num() strips it for the NT8-style
-    RawData.csv/Level2.csv lines."""
+    """Plain float-to-string for 1-second bar files (keeps trailing '.0')."""
     return str(float(x))
 
 
 def format_nt8_timestamp(dt: datetime, micros_override: int = None):
-    """Returns (datePart, fracPart) as 'yyyyMMddHHmmss' and 6-digit
-    microseconds, matching FormatNt8Timestamp() in the C# source. Used for
-    the L1 (execution-tag) and L2 (Level2.csv) lines."""
+    """Returns (datePart, fracPart): 'yyyyMMddHHmmss' and 6-digit microseconds."""
     date_part = dt.strftime("%Y%m%d%H%M%S")
     micros = micros_override if micros_override is not None else dt.microsecond
     frac_part = f"{micros:06d}"
@@ -487,11 +434,8 @@ def format_nt8_timestamp(dt: datetime, micros_override: int = None):
 
 
 def format_l1_timestamp(dt: datetime, micros_override: int = None) -> str:
-    """Returns a single 'yyyyMMdd HHmmss fffffff' string for RawData.csv —
-    a space-separated date, time, and 7-digit sub-second fraction. Python
-    only has microsecond (6-digit) resolution, so the fraction is scaled
-    x10 to fill the 7-digit width the same way .NET's 100ns tick fraction
-    would (e.g. .390680s -> 3906800)."""
+    """Returns 'yyyyMMdd HHmmss fffffff' for RawData.csv (7-digit fraction =
+    microseconds x10, to mimic .NET's 100ns tick fraction)."""
     date_time_part = dt.strftime("%Y%m%d %H%M%S")
     micros = micros_override if micros_override is not None else dt.microsecond
     ticks_frac = micros * 10
@@ -499,15 +443,11 @@ def format_l1_timestamp(dt: datetime, micros_override: int = None) -> str:
     return f"{date_time_part} {frac_part}"
 
 
-def write_one_second_bar(label: str, bar_time: datetime, ticks: list):
-    """Writes one finalized 1-second OHLCV bar to <label>/1Second_tcs.csv,
-    built purely from actual trade prints whose own trade-second falls in
-    this bucket (the same prints RawData.csv logs, just aggregated).
-    Format: timestamp,instrument_key,open,high,low,close,volume
-    -- open = first trade's price, high/low = max/min across all trades in
-    the second, close = last trade's price, volume = sum of trade sizes.
-    Level2.csv / depth data is intentionally NOT touched by this."""
-    path = get_one_second_path(label)
+def write_one_second_bar(symbol: str, bar_time: datetime, ticks: list):
+    """Writes one finalized 1-second OHLCV bar built from actual trade prints.
+    Format: timestamp,instrument_key,open,high,low,close,volume"""
+    cfg = INSTRUMENTS[symbol]
+    path = get_one_second_path(cfg["label"], cfg["one_second_filename"])
     os.makedirs(os.path.dirname(path), exist_ok=True)
     is_new_file = not os.path.exists(path) or os.path.getsize(path) == 0
 
@@ -516,7 +456,7 @@ def write_one_second_bar(label: str, bar_time: datetime, ticks: list):
     bar_str = bar_time.strftime("%Y-%m-%d %H:%M:%S")
 
     row = (
-        f"{bar_str},{FYERS_SYMBOL},"
+        f"{bar_str},{symbol},"
         f"{fmt_bar_num(prices[0])},{fmt_bar_num(max(prices))},"
         f"{fmt_bar_num(min(prices))},{fmt_bar_num(prices[-1])},"
         f"{fmt_bar_num(sum(volumes))}"
@@ -528,9 +468,9 @@ def write_one_second_bar(label: str, bar_time: datetime, ticks: list):
         f.write(row + "\n")
 
 
-# --- Per-instrument state (single symbol here, but keyed for extensibility) ---
-_state = {
-    FYERS_SYMBOL: {
+# --- Per-instrument state ---
+def _new_state() -> dict:
+    return {
         "last_cum_volume": None,
         "last_l1_side": 0,
         "best_bid": None,
@@ -538,46 +478,24 @@ _state = {
         "last_ask_levels": [],  # list[(price, size)], index 0 = best
         "last_bid_levels": [],
         "logged_unrecognized_depth": False,
-        # -- 1-second OHLCV bucketing (independent of the L1/L2 state above) --
+        # 1-second OHLCV bucketing
         "one_second_ticks": {},           # epoch_sec -> list[(price, volume)]
         "one_second_last_flushed_epoch": None,
     }
-}
+
+
+_state = {symbol: _new_state() for symbol in INSTRUMENTS}
 
 
 def extract_depth_levels(message: dict, max_levels: int):
     """
-    Flexible extraction to cope with Fyers' undocumented DepthUpdate schema.
+    Flexible extraction for Fyers' DepthUpdate schema.
 
-    IMPORTANT: this returns None (not []) for a side that this particular
-    message says NOTHING about, and only returns [] for a side the message
-    explicitly reports as empty. That distinction matters a lot to the
-    caller (handle_depth_message): if Fyers ever sends a message that only
-    carries ask data (no bid key at all), we must NOT treat "no bid key"
-    the same as "bid book is now empty" -- doing so was the actual bug:
-    the previous version always returned [] for a missing side, which made
-    handle_depth_message either skip the update (both sides required) or
-    (if only one side matched) silently stop updating best_bid/best_ask
-    for the other side and, worse, diff its levels against an empty list
-    -- wiping out or never establishing that side of the book. That's why
-    only ask-side ("L2;0;...") lines were ever showing up in Level2.csv,
-    best_bid never got set, and every trade downstream fell back to
-    looking like a buy execution (see handle_trade_message: bid_str falls
-    back to the trade price itself whenever best_bid is None, so a
-    sell-side compare against Bid could never actually trigger).
+    Returns (asks, bids). Each is independently either:
+      - a list of (price, size) tuples, best first (possibly empty = side is flat), or
+      - None = this message said nothing about that side (leave book state alone).
 
-    Tries, in order:
-      1. Nested list-of-dict shape confirmed from Fyers' REST depth() API:
-         message['ask' or 'asks'] / message['bid' or 'bids'], each a list of
-         {'price': ..., 'volume': ...} (or 'qty'/'size').
-      2. Flat numbered keys: ask_price{i}/ask_size{i}(or ask_qty{i}),
-         bid_price{i}/bid_size{i}(or bid_qty{i}) for i in 1..max_levels.
-
-    Returns (asks, bids), where each of asks/bids is independently either:
-      - a list of (price, size) tuples, best price first (possibly empty,
-        meaning "this message reports that side as genuinely flat"), or
-      - None, meaning "this message said nothing about that side at all --
-        leave whatever book state you already have for it untouched."
+    Tries nested list-of-dict shape first, then flat numbered keys.
     """
     def conv(levels):
         out = []
@@ -603,10 +521,6 @@ def extract_depth_levels(message: dict, max_levels: int):
     if asks is not None or bids is not None:
         return asks, bids
 
-    # Flat numbered-key fallback. A side only counts as "present" here if at
-    # least one of its numbered keys actually appears in the message --
-    # otherwise we'd again collapse "no data about this side" into "empty",
-    # which is exactly the bug described above.
     ask_keys_present = any(f"ask_price{i}" in message for i in range(1, max_levels + 1))
     bid_keys_present = any(f"bid_price{i}" in message for i in range(1, max_levels + 1))
 
@@ -633,9 +547,7 @@ def extract_depth_levels(message: dict, max_levels: int):
 
 
 def diff_dom_side(side: int, current: list, previous: list, date_part: str, frac_part: str) -> list:
-    """Mirrors DiffDomSide() in the C# source: emits a line for every level
-    that changed price/size (op=0) or dropped out of the book (op=2, size
-    forced to 0). Only emits for levels that actually changed."""
+    """Emits a line for every level that changed (op=0) or dropped out (op=2)."""
     out_lines = []
     max_len = max(len(current), len(previous))
     for level in range(max_len):
@@ -653,18 +565,20 @@ def diff_dom_side(side: int, current: list, previous: list, date_part: str, frac
 
 
 def handle_trade_message(message: dict):
-    """Handles a SymbolUpdate (trade/quote) message -> emits one row per new
-    trade to RawData.csv in 'Timestamp;Price;Bid;Ask;Volume' format, emits a
-    companion 'L1;side;...' execution-tag line to Level2.csv (see the
-    FYERS_WRITE_L1_TAG_LINES comment above), and buckets that same trade
-    print into the current 1-second OHLCV bucket (flushed later by
-    flush_ready_one_second_bars()). Per-trade size is derived from the delta
-    in Fyers' cumulative 'vol_traded_today' field (Fyers doesn't reliably
-    expose a per-tick 'ltq' on this feed in all cases)."""
+    """Handles a SymbolUpdate (trade/quote) message for ANY configured symbol.
+
+    -> one row per new trade in <label>/RawData.csv ('Timestamp;Price;Bid;Ask;Volume'),
+    -> (if enabled for that symbol) a companion 'L1;side;...' line in Level2.csv,
+    -> (if enabled for that symbol) bucketed into the 1-second OHLCV bar.
+
+    Per-trade size is derived from the delta in Fyers' cumulative
+    'vol_traded_today'. For futures this is in UNITS (not lots)."""
     symbol = message.get("symbol")
     state = _state.get(symbol)
-    if state is None:
+    cfg = INSTRUMENTS.get(symbol)
+    if state is None or cfg is None:
         return
+    label = cfg["label"]
 
     ltp = message.get("ltp")
     if ltp is None:
@@ -686,17 +600,7 @@ def handle_trade_message(message: dict):
     if size <= 0:
         return  # no new trade since the last message
 
-    # Fyers' own SymbolUpdate/trade message carries the current best bid/ask
-    # directly (confirmed via raw debug capture: 'bid_price'/'ask_price'/
-    # 'bid_size'/'ask_size' on every tick). That's far more reliable than
-    # leaning solely on best_bid/best_ask as tracked from a *separate*
-    # DepthUpdate/TBT stream -- if that stream is asymmetric, lagging, or
-    # (per the TBT caveat elsewhere in this file) not fully supported for
-    # this instrument type, the trade's own embedded quote is still
-    # correct. Prefer it; fall back to the depth-tracked state only if this
-    # particular message doesn't carry it, and keep the depth-tracked state
-    # in sync either way so handle_depth_message's own diffing doesn't
-    # drift behind what trades are actually seeing.
+    # The trade message carries the current best bid/ask itself; prefer it.
     msg_bid_price = message.get("bid_price")
     msg_ask_price = message.get("ask_price")
 
@@ -721,61 +625,38 @@ def handle_trade_message(message: dict):
     except (TypeError, ValueError, OSError):
         trade_dt = datetime.now(IST)
 
-    # --- 1-second OHLCV bucket (separate file, separate from RawData.csv
-    # and untouched by FYERS_SPLIT_PRINTS below) -- keyed by the trade's own
-    # second (ltt is already 1s-resolution), so late local delivery doesn't
-    # shift a trade into the wrong bar. Flushed by flush_ready_one_second_bars().
-    epoch_sec = int(trade_dt.timestamp())
-    state["one_second_ticks"].setdefault(epoch_sec, []).append((ltp, size))
+    # 1-second OHLCV bucket (keyed by the trade's own second)
+    if cfg["one_second"]:
+        epoch_sec = int(trade_dt.timestamp())
+        state["one_second_ticks"].setdefault(epoch_sec, []).append((ltp, size))
 
-    # ltt only has 1-second resolution; use current receipt-time microseconds
-    # so lines stay orderable (see module-level NOTE above).
+    # ltt only has 1-second resolution; use receipt-time microseconds for ordering.
     recv_micros = datetime.now(IST).microsecond
     timestamp_str = format_l1_timestamp(trade_dt, micros_override=recv_micros)
-    # Matches the C# source: if no bid/ask quote has arrived yet, fall back
-    # to the trade price itself rather than writing "0".
     bid_str = fmt_num(best_bid) if best_bid is not None else fmt_num(ltp)
     ask_str = fmt_num(best_ask) if best_ask is not None else fmt_num(ltp)
 
-    # Same (date, 6-digit-microsecond) pair as the RawData.csv line, just in
-    # the "L2;"-style 6-digit format instead of the 7-digit-tick format, so
-    # the two files line up -- matches how the C# source stamps its "L1;"
-    # companion line off the exact same `t` used for the tape line.
     l1_date_part, l1_frac_part = format_nt8_timestamp(trade_dt, micros_override=recv_micros)
 
-    if FYERS_SPLIT_PRINTS:
-        # Matches the C# script's SplitPrints: emit `lots` separate rows,
-        # each with volume=1, all sharing the same timestamp/price/bid/ask
-        # (same trade moment) -- so a 5-lot print becomes 5 rows instead of 1.
+    if cfg["split"]:
         lots = max(1, int(round(size)))
         for _ in range(lots):
             line = f"{timestamp_str};{fmt_num(ltp)};{bid_str};{ask_str};1"
-            write_l1_line(INSTRUMENT_LABEL, line)
-            if FYERS_WRITE_L1_TAG_LINES:
-                write_l2_line(INSTRUMENT_LABEL, f"L1;{side};{l1_date_part};{l1_frac_part};{fmt_num(ltp)};1")
+            write_l1_line(label, line)
+            if cfg["l1_tags"]:
+                write_l2_line(label, f"L1;{side};{l1_date_part};{l1_frac_part};{fmt_num(ltp)};1")
     else:
         line = f"{timestamp_str};{fmt_num(ltp)};{bid_str};{ask_str};{fmt_num(size)}"
-        write_l1_line(INSTRUMENT_LABEL, line)
-        if FYERS_WRITE_L1_TAG_LINES:
-            write_l2_line(INSTRUMENT_LABEL, f"L1;{side};{l1_date_part};{l1_frac_part};{fmt_num(ltp)};{fmt_num(size)}")
+        write_l1_line(label, line)
+        if cfg["l1_tags"]:
+            write_l2_line(label, f"L1;{side};{l1_date_part};{l1_frac_part};{fmt_num(ltp)};{fmt_num(size)}")
 
 
 def handle_depth_message(message: dict):
-    """Handles a DepthUpdate message -> diffs against the previous snapshot
-    and emits 'L2;' lines only for levels that actually changed, written to
-    the L2-only files. (No 1-second bucketing here by design -- only trade
-    prints feed 1Second_tcs.csv, not depth/DOM data.)
-
-    Each side (ask/bid) is now handled independently: extract_depth_levels()
-    tells us, per side, whether this message reported anything about it at
-    all. A side we got no data for this message is left completely alone --
-    its best_bid/best_ask and last_*_levels stay whatever they already were,
-    and it is NOT diffed (so it can't spuriously get marked as "dropped").
-    This mirrors how the working Quantower bridge reads the DOM: it pulls
-    one coherent snapshot covering both sides via
-    GetDepthOfMarketAggregatedCollections() and only skips the whole update
-    if *both* sides come back empty -- it never lets one side's absence
-    wipe out the other."""
+    """Handles a DepthUpdate message (only for symbols with depth enabled, i.e. TCS).
+    Diffs against the previous snapshot and emits 'L2;' lines only for changed
+    levels. Each side is handled independently: a side the message says nothing
+    about is left untouched."""
     global _raw_depth_debug_count
     if FYERS_DEBUG_RAW_DEPTH_MESSAGES and _raw_depth_debug_count < FYERS_DEBUG_RAW_DEPTH_MESSAGES:
         _raw_depth_debug_count += 1
@@ -783,8 +664,10 @@ def handle_depth_message(message: dict):
 
     symbol = message.get("symbol")
     state = _state.get(symbol)
-    if state is None:
-        return
+    cfg = INSTRUMENTS.get(symbol)
+    if state is None or cfg is None or not cfg["depth"]:
+        return  # Level 1-only symbols (Bank Nifty) never write depth
+    label = cfg["label"]
 
     asks, bids = extract_depth_levels(message, DOM_LEVELS)
     if asks is None and bids is None:
@@ -814,7 +697,7 @@ def handle_depth_message(message: dict):
         state["last_bid_levels"] = bids
 
     for line in lines:
-        write_l2_line(INSTRUMENT_LABEL, line)
+        write_l2_line(label, line)
 
 
 # --- Fyers WebSocket callbacks ---
@@ -822,10 +705,6 @@ def on_message(message):
     try:
         if not isinstance(message, dict):
             return
-        # Route by shape rather than relying on an undocumented "type" key:
-        # a depth-ish message carries book fields; a trade/quote message
-        # carries 'ltp'. Depth is checked first since some feeds echo ltp
-        # on depth snapshots too.
         looks_like_depth = any(
             k in message for k in ("ask", "asks", "bid", "bids", "ask_price1", "bid_price1")
         )
@@ -853,20 +732,31 @@ def on_close(message):
 
 
 def on_open(fyers_socket):
+    # Trades (Level 1) for EVERY configured symbol.
+    l1_symbols = list(INSTRUMENTS.keys())
+    # Depth (Level 2) only for symbols with depth enabled, and only when the
+    # standard feed is the depth source (TBT has its own socket).
+    depth_symbols = [s for s, c in INSTRUMENTS.items() if c["depth"]]
+
     if FYERS_DEPTH_SOURCE == "tbt":
-        # Depth is coming from the separate TBT socket in this mode — only
-        # take trades (L1) from the standard socket, to avoid writing
-        # Level2.csv from two independent feeds at once.
-        logger.info(f"Connected to Fyers Data Socket. Subscribing to {FYERS_SYMBOL} (L1 only — depth via TBT)...")
-        fyers_socket.subscribe(symbols=[FYERS_SYMBOL], data_type="SymbolUpdate")
+        logger.info(f"Connected to Fyers Data Socket. Subscribing L1 for {l1_symbols} (depth via TBT)...")
+        fyers_socket.subscribe(symbols=l1_symbols, data_type="SymbolUpdate")
     else:
-        logger.info(f"Connected to Fyers Data Socket. Subscribing to {FYERS_SYMBOL} (L1 + L2)...")
-        fyers_socket.subscribe(symbols=[FYERS_SYMBOL], data_type="SymbolUpdate")
-        fyers_socket.subscribe(symbols=[FYERS_SYMBOL], data_type="DepthUpdate")
+        logger.info(
+            f"Connected to Fyers Data Socket. Subscribing L1 for {l1_symbols}, "
+            f"L2 depth for {depth_symbols}..."
+        )
+        fyers_socket.subscribe(symbols=l1_symbols, data_type="SymbolUpdate")
+        if depth_symbols:
+            fyers_socket.subscribe(symbols=depth_symbols, data_type="DepthUpdate")
     fyers_socket.keep_running()
 
 
 # --- Google Drive helpers ---
+def _drive_configured() -> bool:
+    return all([GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN])
+
+
 def _get_drive_service():
     creds = Credentials(
         token=None,
@@ -895,14 +785,11 @@ def get_or_create_drive_folder(service, name: str, parent_id: str = None) -> str
 
 
 def upload_file_to_drive(local_path: str, drive_filename: str, folder_name: str):
-    """Uploads/updates a single file inside ONE Drive folder named
-    `folder_name` (e.g. "tcs") sitting at Drive root — no date subfolders.
-
-    This REPLACES whatever is currently on Drive with local_path's content.
-    That's only safe because download_file_from_drive() (called once at
-    startup, see main()) seeds local_path with the prior Drive content
-    first — so local_path always holds "old + new", never just "new"."""
-    if not os.path.exists(local_path) or not all([GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN]):
+    """Uploads/updates a single file inside ONE Drive folder named `folder_name`
+    at Drive root. REPLACES the Drive copy with local_path's content — safe
+    because main() seeds local_path from Drive/GitHub first, so it always
+    holds "old + new"."""
+    if not os.path.exists(local_path) or not _drive_configured():
         return
     try:
         service = _get_drive_service()
@@ -918,34 +805,14 @@ def upload_file_to_drive(local_path: str, drive_filename: str, folder_name: str)
         else:
             service.files().create(body={"name": drive_filename, "parents": [parent_id]}, media_body=media).execute()
     except Exception as e:
-        logger.error(f"Google Drive Upload Error ({drive_filename}): {e}")
+        logger.error(f"Google Drive Upload Error ({folder_name}/{drive_filename}): {e}")
 
 
 def download_file_from_drive(local_path: str, drive_filename: str, folder_name: str) -> bool:
-    """Seeds local_path with whatever is currently on Drive for
-    `drive_filename` inside `folder_name`, BEFORE any new data is written
-    this run.
-
-    Why this exists: this job typically restarts on an ephemeral filesystem
-    (fresh container), so local_path starts empty every run. Without this,
-    the first cloud_sync_loop() cycle would call upload_file_to_drive(),
-    which does an in-place Drive *replace* — overwriting all of yesterday's
-    (or this morning's) accumulated history with just the handful of rows
-    written since restart. Downloading first means local_path already
-    contains the full prior history, so every subsequent write appends onto
-    it and every subsequent Drive sync re-uploads "old + new" rather than
-    "new only" — i.e. data combines across restarts instead of being wiped.
-
-    No-ops (leaves local_path alone) if Drive isn't configured, if nothing
-    exists there yet (first-ever run), or on any error — so a transient
-    Drive hiccup at startup degrades to "start fresh locally" rather than
-    crashing the job.
-
-    Returns True only when it actually restored real bytes into local_path,
-    and False in every other case (not configured, nothing on Drive yet, or
-    an error). main() uses this to decide whether to additionally fall back
-    to restoring from GitHub (see download_file_from_github())."""
-    if not all([GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN]):
+    """Seeds local_path with whatever is on Drive for `drive_filename` inside
+    `folder_name`, BEFORE any new data is written this run. Returns True only
+    when real bytes were restored."""
+    if not _drive_configured():
         return False
     try:
         service = _get_drive_service()
@@ -967,19 +834,19 @@ def download_file_from_drive(local_path: str, drive_filename: str, folder_name: 
                 _, done = downloader.next_chunk()
 
         logger.info(
-            f"Restored '{drive_filename}' from Drive "
+            f"Restored '{folder_name}/{drive_filename}' from Drive "
             f"({os.path.getsize(local_path)} bytes) — new data will be appended onto it."
         )
         return os.path.exists(local_path) and os.path.getsize(local_path) > 0
     except Exception as e:
         logger.error(
-            f"Google Drive Download Error ({drive_filename}): {e} — "
+            f"Google Drive Download Error ({folder_name}/{drive_filename}): {e} — "
             "continuing with a fresh local file for this run."
         )
         return False
 
 
-# --- GitHub helpers (second, independent backup + fallback restore source) ---
+# --- GitHub helpers ---
 def _github_configured() -> bool:
     return bool(GITHUB_TOKEN and GITHUB_REPOSITORY)
 
@@ -993,36 +860,15 @@ def _github_headers() -> dict:
 
 
 def get_github_repo_path(folder_name: str, filename: str) -> str:
-    """Path inside the repo a given local file is mirrored to/from --
-    mirrors the local `data/<folder_name>/<filename>` layout exactly."""
     return f"data/{folder_name}/{filename}"
 
 
-# repo_path -> last known blob SHA. Populated after every successful
-# upload/download so upload_file_to_github() usually doesn't need a GET
-# before its PUT -- halves the number of GitHub API round trips per sync,
-# which both reduces load and shrinks the window for a transient network
-# failure to hit mid-sync.
 _github_file_sha_cache: dict = {}
 
 
 def upload_file_to_github(local_path: str, drive_filename: str, folder_name: str):
-    """Commits local_path's current content to
-    data/<folder_name>/<drive_filename> in the repo, via the Contents API.
-
-    This is an ADDITIONAL backup that runs alongside Google Drive, not a
-    replacement for it -- it fires regardless of whether the Drive upload
-    in this same cycle succeeded, so GitHub ends up with its own
-    independent copy of the data, living in the repo's commit history.
-    Requires GITHUB_TOKEN (with `contents: write` permission on the repo)
-    and GITHUB_REPOSITORY to be set; no-ops silently otherwise, same
-    pattern as upload_file_to_drive().
-
-    Retries GITHUB_MAX_RETRIES times (short backoff) on connection-level
-    failures such as the SSLEOFError/connection-reset errors GitHub Actions
-    runners occasionally hit -- these are far more likely on RawData.csv /
-    Level2.csv once they've grown into the multi-MB range (see the
-    GITHUB_SYNC_FILES comment above)."""
+    """Commits local_path's current content to data/<folder_name>/<drive_filename>
+    via the Contents API. Retries on transient connection errors."""
     if not os.path.exists(local_path) or not _github_configured():
         return
     repo_path = get_github_repo_path(folder_name, drive_filename)
@@ -1031,18 +877,11 @@ def upload_file_to_github(local_path: str, drive_filename: str, folder_name: str
     with open(local_path, "rb") as f:
         content_b64 = base64.b64encode(f.read()).decode("ascii")
 
-    # Use whatever SHA we last saw for this path so most cycles can skip
-    # the GET entirely. If it's stale (someone else touched the file, or
-    # we've never seen it this run) GitHub responds 409/422 and we refetch
-    # once and retry.
     sha = _github_file_sha_cache.get(repo_path)
 
     for attempt in range(1, GITHUB_MAX_RETRIES + 1):
         try:
             if sha is None:
-                # Either never cached, or a previous attempt this call
-                # invalidated it -- fetch fresh. A 404 just means the file
-                # doesn't exist in the repo yet, so the PUT below creates it.
                 get_resp = requests.get(
                     url, headers=_github_headers(), params={"ref": GITHUB_BRANCH},
                     timeout=GITHUB_REQUEST_TIMEOUT_SECONDS,
@@ -1064,8 +903,6 @@ def upload_file_to_github(local_path: str, drive_filename: str, folder_name: str
             )
 
             if put_resp.status_code in (409, 422):
-                # Stale/mismatched SHA -- drop the cache and retry with a
-                # freshly-fetched one instead of failing the whole sync.
                 sha = None
                 _github_file_sha_cache.pop(repo_path, None)
                 if attempt < GITHUB_MAX_RETRIES:
@@ -1089,7 +926,7 @@ def upload_file_to_github(local_path: str, drive_filename: str, folder_name: str
                     f"GitHub Upload attempt {attempt}/{GITHUB_MAX_RETRIES} failed "
                     f"({repo_path}): {e} — retrying in {backoff}s."
                 )
-                sha = None  # play it safe, refetch on the retry
+                sha = None
                 time.sleep(backoff)
             else:
                 logger.error(
@@ -1099,13 +936,12 @@ def upload_file_to_github(local_path: str, drive_filename: str, folder_name: str
 
 
 def download_file_from_github(local_path: str, drive_filename: str, folder_name: str) -> bool:
-    """Restores local_path from data/<folder_name>/<drive_filename> in the
-    repo. Returns True only if it actually wrote real data into local_path.
+    """Restores local_path from data/<folder_name>/<drive_filename> in the repo.
+    Fallback restore source only.
 
-    Used purely as a FALLBACK in main(): tried only when Drive isn't
-    configured, or a Drive restore attempt didn't leave anything usable in
-    local_path (see restore_running_file() below). Retries on transient
-    connection failures, same as upload_file_to_github()."""
+    NOTE: the Contents API only returns inline base64 'content' for files up to
+    ~1 MB, so larger files cannot be restored this way — another reason Bank
+    Nifty tick files should rely on Drive rather than GitHub."""
     if not _github_configured():
         return False
     repo_path = get_github_repo_path(folder_name, drive_filename)
@@ -1161,118 +997,118 @@ def download_file_from_github(local_path: str, drive_filename: str, folder_name:
     return False
 
 
+def build_sync_files() -> list:
+    """Every running file to back up: (label, filename, github_key, drive_interval_seconds)."""
+    files = [
+        (TCS_LABEL, RAW_DATA_FILENAME, "raw", DRIVE_SYNC_INTERVAL_SECONDS),
+        (TCS_LABEL, LEVEL2_FILENAME, "level2", DRIVE_SYNC_INTERVAL_SECONDS),
+        (TCS_LABEL, ONE_SECOND_FILENAME, "1s", DRIVE_SYNC_INTERVAL_SECONDS),
+    ]
+    if BN_ENABLED:
+        files.append((BN_LABEL, RAW_DATA_FILENAME, "bn_raw", BN_DRIVE_SYNC_INTERVAL_SECONDS))
+        if BN_ONE_SECOND:
+            files.append((BN_LABEL, BN_ONE_SECOND_FILENAME, "bn_1s", BN_DRIVE_SYNC_INTERVAL_SECONDS))
+    return files
+
+
 async def cloud_sync_loop():
-    """Syncs all three running files per cycle to Google Drive (every 10s,
-    same as before) AND, as an independent second backup, to GitHub.
+    """Backs up every running file to Google Drive (each on its own cadence,
+    skipping files that haven't grown since their last upload) and, as an
+    independent second backup, to GitHub (throttled; only files named in
+    GITHUB_SYNC_FILES).
 
-    GitHub is throttled to GITHUB_SYNC_INTERVAL_SECONDS (much longer than
-    Drive's 10s) on purpose: each GitHub sync writes up to 3 separate
-    commits (one per file, via the Contents API), so a short interval racks
-    up commits fast over a long-running job (10s -> tens of thousands of
-    commits over 6h; the default 120s -> a few hundred). Which files
-    actually go to GitHub is controlled by GITHUB_SYNC_FILES (see its
-    comment near the top of this file).
-
-    The three Drive calls are spaced a second apart rather than fired back
-    to back -- a cheap way to reduce the odds of tripping Drive's
-    userRateLimitExceeded, which is a per-second/per-100-seconds burst
-    limit, not a hard cap on 3 requests every 10s."""
+    Drive uploads are spaced a second apart to reduce the odds of tripping
+    Drive's userRateLimitExceeded burst limit."""
+    sync_files = build_sync_files()
+    last_drive_sync = {}      # (label, filename) -> time
+    last_drive_size = {}      # (label, filename) -> bytes at last upload
     last_github_sync = 0.0
+
     while True:
         await asyncio.sleep(10)
 
-        raw_path = get_raw_data_path(INSTRUMENT_LABEL)
-        level2_path = get_level2_path(INSTRUMENT_LABEL)
-        one_second_path = get_one_second_path(INSTRUMENT_LABEL)
-
-        await asyncio.to_thread(upload_file_to_drive, raw_path, RAW_DATA_FILENAME, INSTRUMENT_LABEL)
-        await asyncio.sleep(1)
-        await asyncio.to_thread(upload_file_to_drive, level2_path, LEVEL2_FILENAME, INSTRUMENT_LABEL)
-        await asyncio.sleep(1)
-        await asyncio.to_thread(upload_file_to_drive, one_second_path, ONE_SECOND_FILENAME, INSTRUMENT_LABEL)
+        for label, filename, _gh_key, interval in sync_files:
+            key = (label, filename)
+            path = os.path.join(BASE_DATA_DIR, label, filename)
+            if not os.path.exists(path):
+                continue
+            if (time.time() - last_drive_sync.get(key, 0.0)) < interval:
+                continue
+            size = os.path.getsize(path)
+            if size == last_drive_size.get(key):
+                continue  # nothing new since last upload
+            last_drive_sync[key] = time.time()
+            last_drive_size[key] = size
+            await asyncio.to_thread(upload_file_to_drive, path, filename, label)
+            await asyncio.sleep(1)
 
         if _github_configured() and (time.time() - last_github_sync) >= GITHUB_SYNC_INTERVAL_SECONDS:
             last_github_sync = time.time()
-            if "raw" in GITHUB_SYNC_FILES:
-                await asyncio.to_thread(upload_file_to_github, raw_path, RAW_DATA_FILENAME, INSTRUMENT_LABEL)
-            if "level2" in GITHUB_SYNC_FILES:
-                await asyncio.to_thread(upload_file_to_github, level2_path, LEVEL2_FILENAME, INSTRUMENT_LABEL)
-            if "1s" in GITHUB_SYNC_FILES:
-                await asyncio.to_thread(upload_file_to_github, one_second_path, ONE_SECOND_FILENAME, INSTRUMENT_LABEL)
+            for label, filename, gh_key, _interval in sync_files:
+                if gh_key in GITHUB_SYNC_FILES:
+                    path = os.path.join(BASE_DATA_DIR, label, filename)
+                    await asyncio.to_thread(upload_file_to_github, path, filename, label)
 
 
 # =========================================================
-# --- 1-second OHLCV bar aggregation (separate from Level2.csv) ---
+# --- 1-second OHLCV bar aggregation ---
 # =========================================================
-# Ported from a companion Upstox-based 1s collector. Trade prints are
-# bucketed by their own trade-second (see handle_trade_message()) into
-# state["one_second_ticks"], and this loop periodically finalizes/writes
-# any bucket old enough (ONE_SECOND_BUFFER_SECONDS in the past) that no
-# more late trades are expected to land in it. A second with zero trade
-# prints is SKIPPED (not forward-filled) -- same behavior as the Upstox
-# collector this was ported from.
+# Trade prints are bucketed by their own trade-second into state["one_second_ticks"];
+# this loop finalizes/writes any bucket old enough (ONE_SECOND_BUFFER_SECONDS) that
+# no more late trades are expected. Seconds with no trades are SKIPPED.
+# Runs for every symbol with one_second enabled (TCS always; Bank Nifty only if
+# FYERS_BANKNIFTY_1S=true). Depth/Level2 data is never touched here.
 
 def flush_ready_one_second_bars():
-    """Walks forward second-by-second from the last finalized second up to
-    (now - ONE_SECOND_BUFFER_SECONDS), writing one bar per second that saw
-    at least one trade print. Depth/Level2 data is never touched here."""
-    state = _state[FYERS_SYMBOL]
     now_epoch = int(time.time())
     cutoff = now_epoch - ONE_SECOND_BUFFER_SECONDS
 
-    if state["one_second_last_flushed_epoch"] is None:
-        # First call this run -- nothing to backfill, just establish the
-        # starting point so we don't try to flush from the epoch.
-        state["one_second_last_flushed_epoch"] = cutoff - 1
-        return
+    for symbol, cfg in INSTRUMENTS.items():
+        if not cfg["one_second"]:
+            continue
+        state = _state[symbol]
 
-    for epoch_sec in range(state["one_second_last_flushed_epoch"] + 1, cutoff + 1):
-        ticks = state["one_second_ticks"].pop(epoch_sec, None)
-        if not ticks:
-            continue  # no trade print landed in this second -- bar skipped
-        bar_time = datetime.fromtimestamp(epoch_sec, tz=IST)
-        write_one_second_bar(INSTRUMENT_LABEL, bar_time, ticks)
+        if state["one_second_last_flushed_epoch"] is None:
+            state["one_second_last_flushed_epoch"] = cutoff - 1
+            continue
 
-    state["one_second_last_flushed_epoch"] = cutoff
+        for epoch_sec in range(state["one_second_last_flushed_epoch"] + 1, cutoff + 1):
+            ticks = state["one_second_ticks"].pop(epoch_sec, None)
+            if not ticks:
+                continue
+            bar_time = datetime.fromtimestamp(epoch_sec, tz=IST)
+            write_one_second_bar(symbol, bar_time, ticks)
+
+        state["one_second_last_flushed_epoch"] = cutoff
 
 
 async def one_second_timer_loop():
-    """Wakes up roughly once a second to finalize any 1-second OHLCV bars
-    that have fallen outside the buffer window. Wake-time precision doesn't
-    matter for correctness since bars are keyed by each trade's own
-    trade-second, not by this loop's timing."""
+    """Wakes roughly once a second to finalize 1-second bars outside the buffer window."""
     while True:
         now = time.time()
         await asyncio.sleep(1.0 - (now % 1.0))
-        flush_ready_one_second_bars()
+        try:
+            flush_ready_one_second_bars()
+        except Exception as e:
+            logger.error(f"1-second bar flush error: {e}")
 
 
 # =========================================================
-# --- TBT (Versova) 50-level depth feed — opt-in, protobuf over WS ---
+# --- TBT (Versova) 50-level depth feed — opt-in (TCS only) ---
 # =========================================================
-# IMPORTANT: unlike the standard DepthUpdate feed (which appears to send a
-# full book snapshot on every message, hence the simple diff_dom_side()
-# full-list-vs-full-list comparison used above), Fyers' TBT feed sends a
-# FULL snapshot only on the first message per symbol (feed.snapshot=True),
-# and INCREMENTAL per-level updates after that — a message may carry only
-# one changed level. So this keeps a persistent 50-slot book per side and
-# only compares/emits for the levels actually present in each message;
-# levels not mentioned in an incremental update are left untouched (NOT
-# treated as dropped — that was wrong in an earlier draft of this code).
-# This path was already side-independent (asks and bids are always applied
-# separately via _tbt_apply_side for whichever levels the message actually
-# carries) so it did not need the same fix as the standard-feed path above.
+# TBT sends a FULL snapshot on the first message per symbol, then INCREMENTAL
+# per-level updates, so a persistent per-level book is kept and only levels
+# present in each message are compared/emitted.
 _tbt_book = {
-    "asks": {i: None for i in range(DOM_LEVELS)},  # level -> (price, qty) or None
+    "asks": {i: None for i in range(DOM_LEVELS)},
     "bids": {i: None for i in range(DOM_LEVELS)},
 }
 
 
 def _tbt_apply_side(side_label: str, levels, side_code: int, date_part: str, frac_part: str) -> list:
-    """Merges incoming MarketLevel entries into the persistent per-level
-    book for one side, emitting an L2 line only for levels that actually
-    changed value. price==0 with qty>0 is a known TBT anomaly (per Fyers'
-    own reference app) — treated as 'keep previous price, update qty'."""
+    """Merges incoming MarketLevel entries into the persistent book for one
+    side, emitting an L2 line only for levels whose value changed. price==0
+    with qty>0 is a known TBT anomaly — keep previous price, update qty."""
     book = _tbt_book[side_label]
     out_lines = []
     for lvl in levels:
@@ -1284,7 +1120,7 @@ def _tbt_apply_side(side_label: str, levels, side_code: int, date_part: str, fra
         prev = book.get(level)
 
         if price == 0.0 and qty > 0 and prev is not None:
-            price = prev[0]  # anomaly: preserve last known price
+            price = prev[0]
 
         new_val = (price, qty)
         if new_val == prev:
@@ -1299,9 +1135,7 @@ def _tbt_apply_side(side_label: str, levels, side_code: int, date_part: str, fra
 
 
 def handle_tbt_socket_message(data: bytes):
-    """Parses one binary TBT SocketMessage and emits 'L2;' lines for
-    whichever levels actually changed, in the same wire format as the
-    standard-feed path so Level2.csv stays consistent."""
+    """Parses one binary TBT SocketMessage and emits 'L2;' lines (TCS Level2.csv)."""
     socket_message = fyers_tbt_pb2.SocketMessage()
     socket_message.ParseFromString(data)
 
@@ -1314,8 +1148,6 @@ def handle_tbt_socket_message(data: bytes):
             continue
 
         if feed.snapshot:
-            # Full snapshot: reset the book so stale levels from a previous
-            # session don't linger, then apply as normal.
             _tbt_book["asks"] = {i: None for i in range(DOM_LEVELS)}
             _tbt_book["bids"] = {i: None for i in range(DOM_LEVELS)}
 
@@ -1326,13 +1158,11 @@ def handle_tbt_socket_message(data: bytes):
         lines += _tbt_apply_side("bids", feed.depth.bids, 1, date_part, frac_part)
 
         for line in lines:
-            write_l2_line(INSTRUMENT_LABEL, line)
+            write_l2_line(TCS_LABEL, line)
 
 
 async def run_tbt_depth_with_retry():
-    """Connects to Fyers' TBT/Versova WebSocket for real 50-level depth.
-    Only runs when FYERS_DEPTH_SOURCE=tbt. Reconnects with backoff, same
-    pattern as run_websocket_with_retry()."""
+    """Connects to Fyers' TBT/Versova WebSocket. Only runs when FYERS_DEPTH_SOURCE=tbt."""
     if fyers_tbt_pb2 is None:
         raise RuntimeError(
             "FYERS_DEPTH_SOURCE=tbt requires msg_pb2.py (compiled from the "
@@ -1346,7 +1176,7 @@ async def run_tbt_depth_with_retry():
             access_token = get_valid_access_token()
             auth_header = f"{FYERS_APP_ID}-{FYERS_APP_TYPE}:{access_token}"
 
-            logger.info(f"Connecting to Fyers TBT depth feed at {FYERS_TBT_WS_URL} for {FYERS_SYMBOL}...")
+            logger.info(f"Connecting to Fyers TBT depth feed at {FYERS_TBT_WS_URL} for {TCS_SYMBOL}...")
             async with websockets.connect(
                 FYERS_TBT_WS_URL,
                 additional_headers={"Authorization": auth_header},
@@ -1356,7 +1186,7 @@ async def run_tbt_depth_with_retry():
                     "type": 1,
                     "data": {
                         "subs": 1,
-                        "symbols": [FYERS_SYMBOL],
+                        "symbols": [TCS_SYMBOL],
                         "mode": "depth",
                         "channel": "1",
                     },
@@ -1395,11 +1225,11 @@ async def run_tbt_depth_with_retry():
 
 
 async def run_websocket_with_retry():
-    """Keep the data socket alive, regenerating the token if the server
-    rejects it and reconnecting with backoff instead of dying silently."""
+    """Keep the data socket alive, regenerating the token if the server rejects
+    it and reconnecting with backoff instead of dying silently."""
     backoff = 5
     consecutive_failures = 0
-    max_consecutive_failures = 6  # stop wasting the 6h job on bad credentials
+    max_consecutive_failures = 6
     while True:
         try:
             access_token = get_valid_access_token()
@@ -1417,10 +1247,8 @@ async def run_websocket_with_retry():
                 on_message=on_message
             )
             fyers_ws.connect()
-            backoff = 5  # reset after a successful connect
+            backoff = 5
             consecutive_failures = 0
-            # The SDK's own thread drives the socket; just idle here and
-            # let cloud_sync_loop keep running.
             while True:
                 await asyncio.sleep(30)
         except Exception as e:
@@ -1441,42 +1269,30 @@ async def run_websocket_with_retry():
 async def main():
     os.makedirs(BASE_DATA_DIR, exist_ok=True)
 
-    logger.info(f"Starting real-time L1+L2+1s collection for {FYERS_SYMBOL} "
-                f"(depth source: {FYERS_DEPTH_SOURCE})...")
+    logger.info(
+        f"Starting real-time collection — TCS ({TCS_SYMBOL}): L1+L2+1s "
+        f"(depth source: {FYERS_DEPTH_SOURCE})"
+        + (f" | Bank Nifty futures ({BN_SYMBOL}): L1 raw ticks"
+           f"{' + 1s bars' if BN_ONE_SECOND else ''}" if BN_ENABLED else " | Bank Nifty disabled")
+    )
 
-    # Restore prior data BEFORE anything writes locally. This is the fix for
-    # the "overwrites previous data" problem: if this run's local
-    # RawData.csv/Level2.csv/1Second_tcs.csv start empty (fresh container)
-    # and we skip this step, the first cloud_sync_loop() upload replaces
-    # Drive's accumulated file with an almost-empty one.
-    #
-    # Google Drive is tried first, same as before. If Drive isn't configured
-    # (no GOOGLE_* secrets) or a Drive restore didn't actually produce data
-    # for a given file (e.g. Drive is down, or that file was never uploaded
-    # there), GitHub is tried next as a fallback restore source, reading
-    # back whatever cloud_sync_loop() most recently committed there.
-    #
-    # Pulling existing data down first means local writes append onto the
-    # full history, so it keeps combining across restarts instead of
-    # resetting. Only restores when the local file is missing/empty, so it
-    # never clobbers a local file that already has this run's data (e.g. on
-    # a non-ephemeral host where local state survived a restart).
-    async def restore_running_file(local_path: str, filename: str):
+    # Restore prior data BEFORE anything writes locally, so the first cloud
+    # sync appends onto history instead of overwriting it with a near-empty
+    # file. Drive first; GitHub as fallback. Only restores when the local
+    # file is missing/empty.
+    async def restore_running_file(label: str, filename: str):
+        local_path = os.path.join(BASE_DATA_DIR, label, filename)
         if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
             return
         restored = False
-        if all([GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN]):
-            restored = await asyncio.to_thread(download_file_from_drive, local_path, filename, INSTRUMENT_LABEL)
+        if _drive_configured():
+            restored = await asyncio.to_thread(download_file_from_drive, local_path, filename, label)
         if not restored and _github_configured():
-            logger.info(f"Drive didn't restore '{filename}' — falling back to GitHub.")
-            await asyncio.to_thread(download_file_from_github, local_path, filename, INSTRUMENT_LABEL)
+            logger.info(f"Drive didn't restore '{label}/{filename}' — falling back to GitHub.")
+            await asyncio.to_thread(download_file_from_github, local_path, filename, label)
 
-    raw_path = get_raw_data_path(INSTRUMENT_LABEL)
-    level2_path = get_level2_path(INSTRUMENT_LABEL)
-    one_second_path = get_one_second_path(INSTRUMENT_LABEL)
-    await restore_running_file(raw_path, RAW_DATA_FILENAME)
-    await restore_running_file(level2_path, LEVEL2_FILENAME)
-    await restore_running_file(one_second_path, ONE_SECOND_FILENAME)
+    for label, filename, _gh_key, _interval in build_sync_files():
+        await restore_running_file(label, filename)
 
     tasks = [run_websocket_with_retry(), cloud_sync_loop(), one_second_timer_loop()]
     if FYERS_DEPTH_SOURCE == "tbt":
