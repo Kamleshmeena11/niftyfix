@@ -120,6 +120,13 @@ BN_ONE_SECOND = _env_bool("FYERS_BANKNIFTY_1S", "false")
 # Futures vol_traded_today is in UNITS (1 lot = lot-size units). Splitting into
 # 1-volume rows would write dozens of rows per lot, so this defaults to false.
 BN_SPLIT_PRINTS = _env_bool("FYERS_BANKNIFTY_SPLIT_PRINTS", "false")
+# Volume divisor for Bank Nifty. Fyers reports futures volume in UNITS. Set this to
+# the contract lot size (check NSE's current Bank Nifty lot size) to write volume in
+# LOTS instead. 1 = leave volume in units. Use whichever matches what you compare against.
+BN_LOT_SIZE = float(os.environ.get("FYERS_BANKNIFTY_LOT_SIZE", "1"))
+# Log the first N raw Bank Nifty messages exactly as Fyers sends them (0 = off), so you
+# can compare them against the rows written to RawData.csv.
+BN_DEBUG_RAW_MESSAGES = int(os.environ.get("FYERS_BANKNIFTY_DEBUG_RAW", "0"))
 
 # NOTE ON DEPTH: number of levels/side requested for TCS. extract_depth_levels()
 # slices to this cap; fewer levels from Fyers just means fewer lines.
@@ -171,6 +178,8 @@ INSTRUMENTS = {
         "split": FYERS_SPLIT_PRINTS,
         "one_second": True,
         "one_second_filename": ONE_SECOND_FILENAME,
+        "mono_ts": False,                    # TCS timestamps unchanged
+        "vol_divisor": 1.0,
     },
 }
 if BN_ENABLED:
@@ -181,6 +190,8 @@ if BN_ENABLED:
         "split": BN_SPLIT_PRINTS,
         "one_second": BN_ONE_SECOND,
         "one_second_filename": BN_ONE_SECOND_FILENAME,
+        "mono_ts": True,                     # exchange-time based, strictly ordered
+        "vol_divisor": BN_LOT_SIZE if BN_LOT_SIZE > 0 else 1.0,
     }
 
 
@@ -478,6 +489,12 @@ def _new_state() -> dict:
         "last_ask_levels": [],  # list[(price, size)], index 0 = best
         "last_bid_levels": [],
         "logged_unrecognized_depth": False,
+        # timestamp ordering + diagnostics (used by mono_ts instruments)
+        "last_ts_epoch": None,
+        "last_ts_frac": 0,
+        "dbg_count": 0,
+        "msgs_seen": 0,
+        "rows_written": 0,
         # 1-second OHLCV bucketing
         "one_second_ticks": {},           # epoch_sec -> list[(price, volume)]
         "one_second_last_flushed_epoch": None,
@@ -564,6 +581,19 @@ def diff_dom_side(side: int, current: list, previous: list, date_part: str, frac
     return out_lines
 
 
+def _extract_trade_datetime(message: dict):
+    """Exchange trade time (epoch seconds, IST). Fyers field names differ between
+    SDK versions, so try several. Returns None if none is present."""
+    for key in ("last_traded_time", "ltt", "exch_feed_time"):
+        val = message.get(key)
+        if val:
+            try:
+                return datetime.fromtimestamp(int(val), tz=IST)
+            except (TypeError, ValueError, OSError):
+                continue
+    return None
+
+
 def handle_trade_message(message: dict):
     """Handles a SymbolUpdate (trade/quote) message for ANY configured symbol.
 
@@ -572,13 +602,22 @@ def handle_trade_message(message: dict):
     -> (if enabled for that symbol) bucketed into the 1-second OHLCV bar.
 
     Per-trade size is derived from the delta in Fyers' cumulative
-    'vol_traded_today'. For futures this is in UNITS (not lots)."""
+    'vol_traded_today' (units for futures; divided by vol_divisor if set).
+
+    IMPORTANT: the standard Fyers feed is a conflated snapshot feed, not a
+    per-trade tape. Several trades between two snapshots become ONE row here
+    (last price, summed volume). That cannot be fixed from this feed."""
     symbol = message.get("symbol")
     state = _state.get(symbol)
     cfg = INSTRUMENTS.get(symbol)
     if state is None or cfg is None:
         return
     label = cfg["label"]
+
+    state["msgs_seen"] += 1
+    if BN_DEBUG_RAW_MESSAGES and symbol == BN_SYMBOL and state["dbg_count"] < BN_DEBUG_RAW_MESSAGES:
+        state["dbg_count"] += 1
+        logger.info(f"[BN RAW {state['dbg_count']}/{BN_DEBUG_RAW_MESSAGES}] {message}")
 
     ltp = message.get("ltp")
     if ltp is None:
@@ -593,12 +632,13 @@ def handle_trade_message(message: dict):
         return
 
     prev_cum = state["last_cum_volume"]
-    state["last_cum_volume"] = cum_vol
+    state["last_cum_volume"] = cum_vol   # also re-baselines automatically if volume resets
     if prev_cum is None:
         return  # first message just establishes the baseline
-    size = cum_vol - prev_cum
-    if size <= 0:
-        return  # no new trade since the last message
+    size_units = cum_vol - prev_cum
+    if size_units <= 0:
+        return  # no new trade since the last message (or a volume reset)
+    size = size_units / cfg["vol_divisor"]
 
     # The trade message carries the current best bid/ask itself; prefer it.
     msg_bid_price = message.get("bid_price")
@@ -619,19 +659,35 @@ def handle_trade_message(message: dict):
         side = state["last_l1_side"]
     state["last_l1_side"] = side
 
-    ltt = message.get("ltt")
-    try:
-        trade_dt = datetime.fromtimestamp(int(ltt), tz=IST) if ltt else datetime.now(IST)
-    except (TypeError, ValueError, OSError):
-        trade_dt = datetime.now(IST)
+    recv_now = datetime.now(IST)
+
+    if cfg["mono_ts"]:
+        # Exchange trade second + a sub-second fraction derived from how long after
+        # that second we received the message, forced to be strictly increasing
+        # within a second. (The old receipt-microseconds-only approach could wrap
+        # and write rows out of order whenever the feed lagged.)
+        trade_dt = _extract_trade_datetime(message) or recv_now.replace(microsecond=0)
+        epoch_sec = int(trade_dt.timestamp())
+        lag = recv_now.timestamp() - epoch_sec
+        micros = int(lag * 1_000_000) if 0.0 <= lag < 1.0 else 0
+        if state["last_ts_epoch"] == epoch_sec and micros <= state["last_ts_frac"]:
+            micros = min(state["last_ts_frac"] + 1, 999_999)
+        state["last_ts_epoch"], state["last_ts_frac"] = epoch_sec, micros
+        recv_micros = micros
+    else:
+        ltt = message.get("ltt")
+        try:
+            trade_dt = datetime.fromtimestamp(int(ltt), tz=IST) if ltt else recv_now
+        except (TypeError, ValueError, OSError):
+            trade_dt = recv_now
+        epoch_sec = int(trade_dt.timestamp())
+        # ltt only has 1-second resolution; use receipt-time microseconds for ordering.
+        recv_micros = recv_now.microsecond
 
     # 1-second OHLCV bucket (keyed by the trade's own second)
     if cfg["one_second"]:
-        epoch_sec = int(trade_dt.timestamp())
         state["one_second_ticks"].setdefault(epoch_sec, []).append((ltp, size))
 
-    # ltt only has 1-second resolution; use receipt-time microseconds for ordering.
-    recv_micros = datetime.now(IST).microsecond
     timestamp_str = format_l1_timestamp(trade_dt, micros_override=recv_micros)
     bid_str = fmt_num(best_bid) if best_bid is not None else fmt_num(ltp)
     ask_str = fmt_num(best_ask) if best_ask is not None else fmt_num(ltp)
@@ -643,11 +699,13 @@ def handle_trade_message(message: dict):
         for _ in range(lots):
             line = f"{timestamp_str};{fmt_num(ltp)};{bid_str};{ask_str};1"
             write_l1_line(label, line)
+            state["rows_written"] += 1
             if cfg["l1_tags"]:
                 write_l2_line(label, f"L1;{side};{l1_date_part};{l1_frac_part};{fmt_num(ltp)};1")
     else:
         line = f"{timestamp_str};{fmt_num(ltp)};{bid_str};{ask_str};{fmt_num(size)}"
         write_l1_line(label, line)
+        state["rows_written"] += 1
         if cfg["l1_tags"]:
             write_l2_line(label, f"L1;{side};{l1_date_part};{l1_frac_part};{fmt_num(ltp)};{fmt_num(size)}")
 
@@ -1083,7 +1141,9 @@ def flush_ready_one_second_bars():
 
 
 async def one_second_timer_loop():
-    """Wakes roughly once a second to finalize 1-second bars outside the buffer window."""
+    """Wakes roughly once a second to finalize 1-second bars outside the buffer window.
+    Also logs per-symbol message/row counters every 5 minutes."""
+    last_stats = time.time()
     while True:
         now = time.time()
         await asyncio.sleep(1.0 - (now % 1.0))
@@ -1091,6 +1151,10 @@ async def one_second_timer_loop():
             flush_ready_one_second_bars()
         except Exception as e:
             logger.error(f"1-second bar flush error: {e}")
+        if time.time() - last_stats >= 300:
+            last_stats = time.time()
+            for sym, st in _state.items():
+                logger.info(f"[STATS] {sym}: feed messages={st['msgs_seen']} rows written={st['rows_written']}")
 
 
 # =========================================================
