@@ -95,6 +95,11 @@ GITHUB_SYNC_FILES = {
 }
 GITHUB_REQUEST_TIMEOUT_SECONDS = int(os.environ.get("GITHUB_REQUEST_TIMEOUT_SECONDS", "60"))
 GITHUB_MAX_RETRIES = int(os.environ.get("GITHUB_MAX_RETRIES", "3"))
+# Skip the GitHub backup for any file larger than this many MB. The Contents API
+# rejects files over 100 MB, and this script holds the whole file (plus a base64
+# copy) in memory, which stalls or kills the job on multi-GB files.
+GITHUB_MAX_FILE_MB = float(os.environ.get("GITHUB_MAX_FILE_MB", "50"))
+_github_skipped_large = set()
 
 TOKEN_CACHE_PATH = "fyers_token_cache.json"
 
@@ -928,6 +933,17 @@ def upload_file_to_github(local_path: str, drive_filename: str, folder_name: str
     """Commits local_path's current content to data/<folder_name>/<drive_filename>
     via the Contents API. Retries on transient connection errors."""
     if not os.path.exists(local_path) or not _github_configured():
+        return
+    size_mb = os.path.getsize(local_path) / (1024 * 1024)
+    if size_mb > GITHUB_MAX_FILE_MB:
+        skip_key = (folder_name, drive_filename)
+        if skip_key not in _github_skipped_large:
+            _github_skipped_large.add(skip_key)
+            logger.warning(
+                f"Skipping GitHub backup of {folder_name}/{drive_filename}: "
+                f"{size_mb:.0f} MB exceeds GITHUB_MAX_FILE_MB={GITHUB_MAX_FILE_MB:.0f}. "
+                "It is still backed up to Google Drive."
+            )
         return
     repo_path = get_github_repo_path(folder_name, drive_filename)
     url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPOSITORY}/contents/{repo_path}"
