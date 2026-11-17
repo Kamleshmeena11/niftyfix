@@ -107,6 +107,8 @@ GITHUB_MAX_FILE_MB = float(os.environ.get("GITHUB_MAX_FILE_MB", "50"))
 _github_skipped_large = set()
 
 TOKEN_CACHE_PATH = "fyers_token_cache.json"
+# Step 4 of the TOTP login. api-t2.fyers.in/api/v3/token returns 404 now; the working host is api-t1.
+FYERS_TOKEN_URL = os.environ.get("FYERS_TOKEN_URL", "https://api-t1.fyers.in/api/v3/token")
 
 # =========================================================
 # --- Instruments ---
@@ -123,7 +125,7 @@ FYERS_SYMBOL = TCS_SYMBOL            # kept for backward compatibility
 INSTRUMENT_LABEL = TCS_LABEL         # kept for backward compatibility
 
 BN_ENABLED = _env_bool("FYERS_BANKNIFTY_ENABLED", "true")
-BN_SYMBOL = os.environ.get("FYERS_BANKNIFTY_SYMBOL", "NSE:BANKNIFTY26NOVFUT")
+BN_SYMBOL = os.environ.get("FYERS_BANKNIFTY_SYMBOL", "NSE:BANKNIFTY26OCTFUT")
 BN_LABEL = os.environ.get("FYERS_BANKNIFTY_LABEL", "banknifty")
 # Optional 1-second OHLCV bars for Bank Nifty (off by default: you asked for raw ticks).
 BN_ONE_SECOND = _env_bool("FYERS_BANKNIFTY_1S", "false")
@@ -236,7 +238,35 @@ def _save_token_cache(access_token: str):
         logger.warning(f"Could not save token cache: {e}")
 
 
+class FyersLoginCooldown(RuntimeError):
+    """Raised instead of trying to log in again too soon (protects against Cloudflare 429 / error 1015)."""
+    def __init__(self, wait: float):
+        super().__init__(f"Fyers login cooling down for another {int(wait)}s")
+        self.wait = wait
+
+
+_login_block_until = 0.0
+
+
 def generate_access_token_via_totp() -> str:
+    """Login with a cool-down: after a failure wait 60 s, after a rate limit (429 / 1015) wait 15 minutes,
+    so the websocket task and the TBT task cannot keep hitting Fyers' login and get blocked."""
+    global _login_block_until
+    remaining = _login_block_until - time.time()
+    if remaining > 0:
+        raise FyersLoginCooldown(remaining)
+    try:
+        return _generate_access_token_via_totp()
+    except Exception as e:
+        text = str(e)
+        limited = "429" in text or "1015" in text or "Access denied" in text
+        _login_block_until = time.time() + (900 if limited else 60)
+        if limited:
+            logger.error("Fyers login is rate limited (429 / Cloudflare 1015). Waiting 15 minutes before the next attempt.")
+        raise
+
+
+def _generate_access_token_via_totp() -> str:
     """Fully automated Fyers login using client ID + TOTP secret + PIN."""
     required = {
         "FYERS_FY_ID": FYERS_FY_ID,
@@ -270,7 +300,7 @@ def generate_access_token_via_totp() -> str:
     def _post(url: str, payload: dict, step_name: str, headers: dict = None):
         resp = session.post(url, json=payload, headers=headers)
         if not resp.ok:
-            raise RuntimeError(f"{step_name} failed ({resp.status_code}): {resp.text}")
+            raise RuntimeError(f"{step_name} failed ({resp.status_code}): {resp.text[:200]}")
         return resp
 
     # Step 1: send login OTP request
@@ -307,14 +337,14 @@ def generate_access_token_via_totp() -> str:
     # This endpoint returns HTTP 308 on success with the redirect URL in the
     # JSON body — it must NOT be auto-followed.
     r4 = session.post(
-        "https://api-t2.fyers.in/api/v3/token",
+        FYERS_TOKEN_URL,
         json=token_payload,
         headers=headers,
         allow_redirects=False
     )
     if r4.status_code != 308:
         raise RuntimeError(
-            f"Unexpected status {r4.status_code} during auth_code exchange: {r4.text}"
+            f"Unexpected status {r4.status_code} during auth_code exchange: {r4.text[:200]}"
         )
     r4_data = r4.json()
     redirect_url = r4_data.get("Url") or r4_data.get("url")
@@ -1304,6 +1334,9 @@ async def run_tbt_depth_with_retry():
                             logger.error(f"Error parsing TBT message: {e}")
                     else:
                         logger.info(f"TBT text message: {message}")
+        except FyersLoginCooldown as e:
+            logger.warning(f"{e} (TBT depth feed waiting)")
+            await asyncio.sleep(min(max(e.wait, 5), 900))
         except Exception as e:
             logger.error(f"TBT depth socket crashed: {e} — retrying in {backoff}s. "
                          "If this keeps happening, TBT may not be enabled for this "
@@ -1340,6 +1373,10 @@ async def run_websocket_with_retry():
             consecutive_failures = 0
             while True:
                 await asyncio.sleep(30)
+        except FyersLoginCooldown as e:
+            logger.warning(f"{e} (data socket waiting)")
+            await asyncio.sleep(min(max(e.wait, 5), 900))
+            continue
         except Exception as e:
             consecutive_failures += 1
             logger.error(f"WebSocket loop crashed: {e} — retrying in {backoff}s")
