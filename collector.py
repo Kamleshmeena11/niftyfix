@@ -142,6 +142,15 @@ BN_LOT_SIZE = float(os.environ.get("FYERS_BANKNIFTY_LOT_SIZE", "1"))
 # can compare them against the rows written to RawData.csv.
 BN_DEBUG_RAW_MESSAGES = int(os.environ.get("FYERS_BANKNIFTY_DEBUG_RAW", "0"))
 
+# --- Bank Nifty ~estimate volume (same logic as the HTML Time & Sales tape) ---
+# Fyers sends SNAPSHOTS. When day volume jumps by more than last_traded_qty, the last print is booked
+# at its exact price and the rest (volume that traded between two snapshots) is the "~estimate",
+# booked at a guessed price. These settings must match the HTML ("~est. at" and tick size).
+BN_EST_ENABLED = _env_bool("FYERS_BANKNIFTY_EST", "true")
+BN_EST_AT = os.environ.get("FYERS_BANKNIFTY_EST_AT", "cur").strip().lower()   # cur | prev | spread
+BN_TICK_SIZE = float(os.environ.get("FYERS_BANKNIFTY_TICK_SIZE", "0.05"))     # must equal the HTML tick size
+BN_GAP_SECONDS = float(os.environ.get("FYERS_BANKNIFTY_GAP_SECONDS", "15"))   # same as the HTML GAP_MS
+
 # NOTE ON DEPTH: number of levels/side requested for TCS. extract_depth_levels()
 # slices to this cap; fewer levels from Fyers just means fewer lines.
 DOM_LEVELS = int(os.environ.get("FYERS_DOM_LEVELS", "50"))
@@ -194,6 +203,7 @@ INSTRUMENTS = {
         "one_second_filename": ONE_SECOND_FILENAME,
         "mono_ts": False,                    # TCS timestamps unchanged
         "vol_divisor": 1.0,
+        "est": False,                        # TCS keeps the original single-row behavior
     },
 }
 if BN_ENABLED:
@@ -206,6 +216,7 @@ if BN_ENABLED:
         "one_second_filename": BN_ONE_SECOND_FILENAME,
         "mono_ts": True,                     # exchange-time based, strictly ordered
         "vol_divisor": BN_LOT_SIZE if BN_LOT_SIZE > 0 else 1.0,
+        "est": BN_ENABLED and BN_EST_ENABLED,  # print + ~estimate rows, like the HTML Time & Sales
     }
 
 
@@ -542,6 +553,11 @@ def _new_state() -> dict:
         # 1-second OHLCV bucketing
         "one_second_ticks": {},           # epoch_sec -> list[(price, volume)]
         "one_second_last_flushed_epoch": None,
+        # ~estimate logic (Bank Nifty): previous trade price / quote and last message time
+        "p_ltp": 0.0,
+        "p_bid": 0.0,
+        "p_ask": 0.0,
+        "last_msg_at": 0.0,
     }
 
 
@@ -638,6 +654,159 @@ def _extract_trade_datetime(message: dict):
     return None
 
 
+# =========================================================
+# --- Bank Nifty: print + ~estimate rows (same as the HTML Time & Sales) ---
+# =========================================================
+def _aggressor(p, prev_p, b_pre, a_pre, b_now, a_now, last_side):
+    """Buy (1) / sell (-1) decision. The quote that was live BEFORE the trade is the one it actually hit;
+    the current quote is a second opinion; the tick rule decides the rest."""
+    pre_ok = b_pre > 0 and a_pre > 0 and b_pre < a_pre
+    if pre_ok:
+        if p >= a_pre:
+            return 1
+        if p <= b_pre:
+            return -1
+    buy = a_now > 0 and p >= a_now
+    sell = b_now > 0 and p <= b_now
+    if not pre_ok:
+        buy = buy or (a_pre > 0 and p >= a_pre)
+        sell = sell or (b_pre > 0 and p <= b_pre)
+    if buy != sell:
+        return 1 if buy else -1
+    if p > prev_p:
+        return 1
+    if p < prev_p:
+        return -1
+    return last_side
+
+
+def _quote_for(side, price, bid, ask):
+    """Nudge only the crossing edge of the quote onto the price so the chart's rule
+    (price >= ask = buy, price <= bid = sell) agrees with the side decided above."""
+    if not bid > 0:
+        bid = price - 1e-6
+    if not ask > 0:
+        ask = price + 1e-6
+    if side == 1:
+        ask = min(ask, price)
+        bid = min(bid, ask)
+    elif side == -1:
+        bid = max(bid, price)
+        ask = max(ask, bid)
+    else:
+        if ask <= price:
+            ask = price + 1e-6
+        if bid >= price:
+            bid = price - 1e-6
+    return bid, ask
+
+
+def _place_missed(p_prev, ltp, vol):
+    """Where the ~estimated volume is booked (same 3 modes as the HTML '~est. at'):
+    cur = at the current price, prev = at the previous trade price,
+    spread = evenly over every tick level between the two prices."""
+    ts, mode = BN_TICK_SIZE, BN_EST_AT
+    if mode == "prev" or (p_prev == ltp and mode != "cur"):
+        return [(p_prev, vol)]
+    if mode == "spread" and p_prev != ltp:
+        d = 1 if ltp > p_prev else -1
+        cnt = min(60, max(1, int(round(abs(ltp - p_prev) / ts)) + 1))
+        if cnt > 1 and vol >= cnt:
+            base = int(vol // cnt)
+            rem = int(vol - base * cnt)
+            return [
+                (ltp if i == cnt - 1 else round(round((p_prev + d * ts * i) / ts) * ts, 4),
+                 base + (1 if i >= cnt - rem else 0))
+                for i in range(cnt)
+            ]
+    return [(ltp, vol)]
+
+
+def _handle_trade_with_estimates(symbol: str, state: dict, cfg: dict, message: dict, ltp: float, cum_vol: float):
+    """Bank Nifty trade handling.
+    Day volume only grows, so every increase is real traded volume:
+      - last_traded_qty  = the last print, booked EXACTLY at ltp
+      - the rest of the increase traded between two snapshots: its exact price is unknown, so it is booked
+        as '~estimate' rows at the price(s) chosen by FYERS_BANKNIFTY_EST_AT (same as the HTML tape).
+    Estimate rows are written first, the real print last, each with its own bid/ask so the chart classifies
+    them as buy/sell exactly like Time & Sales does."""
+    label = cfg["label"]
+    now = time.time()
+    bid_now = float(message.get("bid_price") or 0) or state["p_bid"]
+    ask_now = float(message.get("ask_price") or 0) or state["p_ask"]
+
+    def settle(trade_px):
+        state["p_bid"], state["p_ask"] = bid_now, ask_now
+        if bid_now:
+            state["best_bid"] = bid_now
+        if ask_now:
+            state["best_ask"] = ask_now
+        if trade_px:
+            state["p_ltp"] = trade_px
+
+    prev_cum = state["last_cum_volume"]
+    if prev_cum is None:                              # first message just establishes the baseline
+        state["last_cum_volume"] = cum_vol
+        state["last_msg_at"] = now
+        settle(ltp)
+        return
+    if cum_vol < prev_cum:
+        if cum_vol < prev_cum * 0.5:                  # volume reset = new session
+            state["last_cum_volume"] = cum_vol
+            state["last_msg_at"] = now
+            settle(ltp)
+        return                                        # late / out-of-order snapshot: ignore it completely
+    dv = cum_vol - prev_cum
+    state["last_cum_volume"] = cum_vol
+    silent = (now - state["last_msg_at"]) if state["last_msg_at"] else 0.0
+    state["last_msg_at"] = now
+    if dv <= 0:
+        settle(0)                                     # quote change only, no trade
+        return
+
+    qty = float(message.get("last_traded_qty") or 0)
+    p_prev = state["p_ltp"] or ltp
+    b0 = state["p_bid"] or bid_now
+    a0 = state["p_ask"] or ask_now
+    main = qty if 0 < qty < dv else dv                # last print = exact price
+    missed = dv - main                                # volume between snapshots = ~estimate
+    if missed > 0 and silent > BN_GAP_SECONDS:
+        missed = 0                                    # socket gap: cannot be placed, not booked (same as HTML)
+
+    side = _aggressor(ltp, p_prev, b0, a0, bid_now, ask_now, state["last_l1_side"])
+
+    rows = []                                         # (price, bid, ask, volume_in_units)
+    if missed > 0:
+        ms = 1 if ltp > p_prev else (-1 if ltp < p_prev else side)
+        for price, vol in _place_missed(p_prev, ltp, missed):
+            qb, qa = _quote_for(ms, price, b0, a0)
+            rows.append((price, qb, qa, vol))
+    qb, qa = _quote_for(side, ltp, b0, a0)
+    rows.append((ltp, qb, qa, main))                  # estimates first, real print last (as in the HTML)
+    if side:
+        state["last_l1_side"] = side
+
+    recv_now = datetime.now(IST)
+    trade_dt = _extract_trade_datetime(message) or recv_now.replace(microsecond=0)
+    epoch_sec = int(trade_dt.timestamp())
+    lag = recv_now.timestamp() - epoch_sec
+    micros = int(lag * 1_000_000) if 0.0 <= lag < 1.0 else 0
+
+    for price, b, a, vol in rows:
+        # strictly increasing timestamp inside one second, so no row is mistaken for a duplicate
+        if state["last_ts_epoch"] == epoch_sec and micros <= state["last_ts_frac"]:
+            micros = min(state["last_ts_frac"] + 1, 999_999)
+        state["last_ts_epoch"], state["last_ts_frac"] = epoch_sec, micros
+        size = vol / cfg["vol_divisor"]
+        if cfg["one_second"]:
+            state["one_second_ticks"].setdefault(epoch_sec, []).append((price, size))
+        ts_str = format_l1_timestamp(trade_dt, micros_override=micros)
+        write_l1_line(label, f"{ts_str};{fmt_num(price)};{fmt_num(b)};{fmt_num(a)};{fmt_num(size)}")
+        state["rows_written"] += 1
+
+    settle(ltp)
+
+
 def handle_trade_message(message: dict):
     """Handles a SymbolUpdate (trade/quote) message for ANY configured symbol.
 
@@ -650,7 +819,8 @@ def handle_trade_message(message: dict):
 
     IMPORTANT: the standard Fyers feed is a conflated snapshot feed, not a
     per-trade tape. Several trades between two snapshots become ONE row here
-    (last price, summed volume). That cannot be fixed from this feed."""
+    (last price, summed volume) for TCS. For Bank Nifty (cfg["est"]) the jump is
+    split into the exact last print + ~estimate rows (see _handle_trade_with_estimates)."""
     symbol = message.get("symbol")
     state = _state.get(symbol)
     cfg = INSTRUMENTS.get(symbol)
@@ -673,6 +843,11 @@ def handle_trade_message(message: dict):
     try:
         cum_vol = float(cum_vol)
     except (TypeError, ValueError):
+        return
+
+    # Bank Nifty: print + ~estimate rows, same price levels as the HTML Time & Sales tape
+    if cfg.get("est"):
+        _handle_trade_with_estimates(symbol, state, cfg, message, float(ltp), cum_vol)
         return
 
     prev_cum = state["last_cum_volume"]
@@ -1399,7 +1574,9 @@ async def main():
         f"Starting real-time collection — TCS ({TCS_SYMBOL}): L1+L2+1s "
         f"(depth source: {FYERS_DEPTH_SOURCE})"
         + (f" | Bank Nifty futures ({BN_SYMBOL}): L1 raw ticks"
-           f"{' + 1s bars' if BN_ONE_SECOND else ''}" if BN_ENABLED else " | Bank Nifty disabled")
+           f"{' + 1s bars' if BN_ONE_SECOND else ''}"
+           f"{' + ~estimate rows (est_at=' + BN_EST_AT + ', tick=' + str(BN_TICK_SIZE) + ')' if BN_EST_ENABLED else ''}"
+           if BN_ENABLED else " | Bank Nifty disabled")
     )
 
     # Restore prior data BEFORE anything writes locally, so the first cloud
