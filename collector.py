@@ -123,7 +123,7 @@ FYERS_SYMBOL = TCS_SYMBOL            # kept for backward compatibility
 INSTRUMENT_LABEL = TCS_LABEL         # kept for backward compatibility
 
 BN_ENABLED = _env_bool("FYERS_BANKNIFTY_ENABLED", "true")
-BN_SYMBOL = os.environ.get("FYERS_BANKNIFTY_SYMBOL", "NSE:BANKNIFTY26OCTFUT")
+BN_SYMBOL = os.environ.get("FYERS_BANKNIFTY_SYMBOL", "NSE:BANKNIFTY26NOVFUT")
 BN_LABEL = os.environ.get("FYERS_BANKNIFTY_LABEL", "banknifty")
 # Optional 1-second OHLCV bars for Bank Nifty (off by default: you asked for raw ticks).
 BN_ONE_SECOND = _env_bool("FYERS_BANKNIFTY_1S", "false")
