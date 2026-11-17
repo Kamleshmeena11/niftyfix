@@ -117,7 +117,7 @@ FYERS_TOKEN_URL = os.environ.get("FYERS_TOKEN_URL", "https://api-t1.fyers.in/api
 # 2) Bank Nifty futures: Level 1 raw ticks only (RawData.csv), optional 1s bars
 #
 # Bank Nifty futures symbol format: NSE:BANKNIFTY<YY><MON>FUT, e.g.
-# NSE:BANKNIFTY26OCTFUT. Contracts are monthly — UPDATE FYERS_BANKNIFTY_SYMBOL
+# NSE:BANKNIFTY26NOVFUT. Contracts are monthly — UPDATE FYERS_BANKNIFTY_SYMBOL
 # AT EACH EXPIRY ROLLOVER (verify the exact symbol in Fyers' symbol master).
 TCS_SYMBOL = os.environ.get("FYERS_SYMBOL", "NSE:TCS-EQ")
 TCS_LABEL = "tcs"
@@ -125,7 +125,7 @@ FYERS_SYMBOL = TCS_SYMBOL            # kept for backward compatibility
 INSTRUMENT_LABEL = TCS_LABEL         # kept for backward compatibility
 
 BN_ENABLED = _env_bool("FYERS_BANKNIFTY_ENABLED", "true")
-BN_SYMBOL = os.environ.get("FYERS_BANKNIFTY_SYMBOL", "NSE:BANKNIFTY26OCTFUT")
+BN_SYMBOL = os.environ.get("FYERS_BANKNIFTY_SYMBOL", "NSE:BANKNIFTY26NOVFUT")
 BN_LABEL = os.environ.get("FYERS_BANKNIFTY_LABEL", "banknifty")
 # Optional 1-second OHLCV bars for Bank Nifty (off by default: you asked for raw ticks).
 BN_ONE_SECOND = _env_bool("FYERS_BANKNIFTY_1S", "false")
