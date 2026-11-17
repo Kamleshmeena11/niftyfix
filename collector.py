@@ -28,6 +28,9 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from google.oauth2.credentials import Credentials
 
+# GitHub tick publisher (Bank Nifty ticks -> data/<label>/ticks/<date>/<HHMM>.csv, read by the HTML chart)
+import github_tick_publisher as ghticks
+
 # --- Logging ---
 sys.stdout.reconfigure(line_buffering=True)
 logging.basicConfig(
@@ -87,7 +90,9 @@ GITHUB_SYNC_INTERVAL_SECONDS = int(os.environ.get("GITHUB_SYNC_INTERVAL_SECONDS"
 # Which running files get pushed to GitHub. Keys:
 #   TCS:        raw, level2, 1s
 #   Bank Nifty: bn_raw, bn_1s   (OFF by default — BN tick files get large;
-#                                Drive + the end-of-run artifact are better for those)
+#                                Drive + the end-of-run artifact are better for those.
+#                                Bank Nifty ticks for the HTML chart go through
+#                                github_tick_publisher.py in small 5-minute files instead.)
 GITHUB_SYNC_FILES = {
     f.strip().lower()
     for f in os.environ.get("GITHUB_SYNC_FILES", "raw,level2,1s").split(",")
@@ -128,6 +133,8 @@ BN_SPLIT_PRINTS = _env_bool("FYERS_BANKNIFTY_SPLIT_PRINTS", "false")
 # Volume divisor for Bank Nifty. Fyers reports futures volume in UNITS. Set this to
 # the contract lot size (check NSE's current Bank Nifty lot size) to write volume in
 # LOTS instead. 1 = leave volume in units. Use whichever matches what you compare against.
+# NOTE: keep this at 1 if the HTML chart's live Fyers feed is used together with the
+# GitHub history, because the browser's live volume is in UNITS.
 BN_LOT_SIZE = float(os.environ.get("FYERS_BANKNIFTY_LOT_SIZE", "1"))
 # Log the first N raw Bank Nifty messages exactly as Fyers sends them (0 = off), so you
 # can compare them against the rows written to RawData.csv.
@@ -407,7 +414,8 @@ def append_pipe_line(path: str, line: str):
 
 
 def write_l1_line(label: str, line: str):
-    """Appends one data row to <label>/RawData.csv, writing the header first if new."""
+    """Appends one data row to <label>/RawData.csv, writing the header first if new.
+    Also queues the row for the GitHub tick publisher (Bank Nifty only; other labels are ignored)."""
     path = get_raw_data_path(label)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     is_new_file = not os.path.exists(path) or os.path.getsize(path) == 0
@@ -415,6 +423,7 @@ def write_l1_line(label: str, line: str):
         if is_new_file:
             f.write(RAW_DATA_HEADER + "\n")
         f.write(line + "\n")
+    ghticks.publish_tick(label, line)
 
 
 def write_l2_line(label: str, line: str):
@@ -1374,7 +1383,12 @@ async def main():
     for label, filename, _gh_key, _interval in build_sync_files():
         await restore_running_file(label, filename)
 
-    tasks = [run_websocket_with_retry(), cloud_sync_loop(), one_second_timer_loop()]
+    tasks = [
+        run_websocket_with_retry(),
+        cloud_sync_loop(),
+        one_second_timer_loop(),
+        ghticks.publisher_loop(),      # Bank Nifty ticks -> GitHub (5-minute files for the HTML chart)
+    ]
     if FYERS_DEPTH_SOURCE == "tbt":
         tasks.append(run_tbt_depth_with_retry())
 
@@ -1386,3 +1400,8 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Collector stopped manually.")
+    finally:
+        try:
+            ghticks.flush_now()        # push any ticks still queued before exiting
+        except Exception as e:
+            logger.error(f"Final GitHub tick flush failed: {e}")
