@@ -28,7 +28,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from google.oauth2.credentials import Credentials
 
-# GitHub tick publisher (Bank Nifty ticks -> data/<label>/ticks/<date>/<HHMM>.csv, read by the HTML chart)
+# GitHub tick publisher (Bank Nifty & Reliance ticks -> data/<label>/ticks/<date>/<HHMM>.csv, read by the HTML chart)
 import github_tick_publisher as ghticks
 
 # --- Logging ---
@@ -93,6 +93,7 @@ GITHUB_SYNC_INTERVAL_SECONDS = int(os.environ.get("GITHUB_SYNC_INTERVAL_SECONDS"
 #                                Drive + the end-of-run artifact are better for those.
 #                                Bank Nifty ticks for the HTML chart go through
 #                                github_tick_publisher.py in small 5-minute files instead.)
+#   Reliance:   rel_raw, rel_1s (OFF by default for the same reason)
 GITHUB_SYNC_FILES = {
     f.strip().lower()
     for f in os.environ.get("GITHUB_SYNC_FILES", "raw,level2,1s").split(",")
@@ -115,9 +116,10 @@ FYERS_TOKEN_URL = os.environ.get("FYERS_TOKEN_URL", "https://api-t1.fyers.in/api
 # =========================================================
 # 1) TCS (equity cash): Level 1 + Level 2 + 1-second bars  (UNCHANGED behavior)
 # 2) Bank Nifty futures: Level 1 raw ticks only (RawData.csv), optional 1s bars
+# 3) Reliance equity: Level 1 raw ticks only (RawData.csv), optional 1s bars
 #
 # Bank Nifty futures symbol format: NSE:BANKNIFTY<YY><MON>FUT, e.g.
-# NSE:BANKNIFTY26NOVFUT. Contracts are monthly — UPDATE FYERS_BANKNIFTY_SYMBOL
+# NSE:BANKNIFTY26DECFUT. Contracts are monthly — UPDATE FYERS_BANKNIFTY_SYMBOL
 # AT EACH EXPIRY ROLLOVER (verify the exact symbol in Fyers' symbol master).
 TCS_SYMBOL = os.environ.get("FYERS_SYMBOL", "NSE:TCS-EQ")
 TCS_LABEL = "tcs"
@@ -125,9 +127,9 @@ FYERS_SYMBOL = TCS_SYMBOL            # kept for backward compatibility
 INSTRUMENT_LABEL = TCS_LABEL         # kept for backward compatibility
 
 BN_ENABLED = _env_bool("FYERS_BANKNIFTY_ENABLED", "true")
-BN_SYMBOL = os.environ.get("FYERS_BANKNIFTY_SYMBOL", "NSE:BANKNIFTY26NOVFUT")
+BN_SYMBOL = os.environ.get("FYERS_BANKNIFTY_SYMBOL", "NSE:BANKNIFTY26DECFUT")
 BN_LABEL = os.environ.get("FYERS_BANKNIFTY_LABEL", "banknifty")
-# Optional 1-second OHLCV bars for Bank Nifty (off by default: you asked for raw ticks).
+# Optional 1-second OHLCV bars for Bank Nifty (off by default: raw ticks only).
 BN_ONE_SECOND = _env_bool("FYERS_BANKNIFTY_1S", "false")
 # Futures vol_traded_today is in UNITS (1 lot = lot-size units). Splitting into
 # 1-volume rows would write dozens of rows per lot, so this defaults to false.
@@ -142,7 +144,15 @@ BN_LOT_SIZE = float(os.environ.get("FYERS_BANKNIFTY_LOT_SIZE", "1"))
 # can compare them against the rows written to RawData.csv.
 BN_DEBUG_RAW_MESSAGES = int(os.environ.get("FYERS_BANKNIFTY_DEBUG_RAW", "0"))
 
-# --- Bank Nifty ~estimate volume (same logic as the HTML Time & Sales tape) ---
+# --- Reliance Equity (same L1 + ~estimate setup as Bank Nifty) ---
+REL_ENABLED = _env_bool("FYERS_RELIANCE_ENABLED", "true")
+REL_SYMBOL = os.environ.get("FYERS_RELIANCE_SYMBOL", "NSE:RELIANCE-EQ")
+REL_LABEL = os.environ.get("FYERS_RELIANCE_LABEL", "reliance")
+REL_ONE_SECOND = _env_bool("FYERS_RELIANCE_1S", "false")
+REL_SPLIT_PRINTS = _env_bool("FYERS_RELIANCE_SPLIT_PRINTS", "false")
+REL_ONE_SECOND_FILENAME = f"1Second_{REL_LABEL}.csv"
+
+# --- ~estimate volume (same logic as the HTML Time & Sales tape; shared by Bank Nifty & Reliance) ---
 # Fyers sends SNAPSHOTS. When day volume jumps by more than last_traded_qty, the last print is booked
 # at its exact price and the rest (volume that traded between two snapshots) is the "~estimate",
 # booked at a guessed price. These settings must match the HTML ("~est. at" and tick size).
@@ -177,6 +187,7 @@ BASE_DATA_DIR = "data"
 # Layout: ONE folder per instrument.
 #   data/tcs/RawData.csv, data/tcs/Level2.csv, data/tcs/1Second_tcs.csv
 #   data/banknifty/RawData.csv  (+ 1Second_banknifty.csv if enabled)
+#   data/reliance/RawData.csv   (+ 1Second_reliance.csv if enabled)
 RAW_DATA_FILENAME = "RawData.csv"
 LEVEL2_FILENAME = "Level2.csv"
 ONE_SECOND_FILENAME = "1Second_tcs.csv"          # TCS (unchanged name)
@@ -188,7 +199,7 @@ ONE_SECOND_HEADER = "timestamp,instrument_key,open,high,low,close,volume"
 ONE_SECOND_BUFFER_SECONDS = int(os.environ.get("FYERS_1S_BUFFER_SECONDS", "2"))
 
 # Drive sync cadence (seconds). Each sync re-uploads the whole file, and the
-# Bank Nifty tick file grows much faster than TCS, so it syncs less often.
+# Bank Nifty / Reliance tick files grow faster than TCS, so they sync less often.
 DRIVE_SYNC_INTERVAL_SECONDS = int(os.environ.get("DRIVE_SYNC_INTERVAL_SECONDS", "10"))
 BN_DRIVE_SYNC_INTERVAL_SECONDS = int(os.environ.get("BN_DRIVE_SYNC_INTERVAL_SECONDS", "30"))
 
@@ -217,6 +228,18 @@ if BN_ENABLED:
         "mono_ts": True,                     # exchange-time based, strictly ordered
         "vol_divisor": BN_LOT_SIZE if BN_LOT_SIZE > 0 else 1.0,
         "est": BN_ENABLED and BN_EST_ENABLED,  # print + ~estimate rows, like the HTML Time & Sales
+    }
+if REL_ENABLED:
+    INSTRUMENTS[REL_SYMBOL] = {
+        "label": REL_LABEL,
+        "depth": False,                      # Level 1 only (like Bank Nifty)
+        "l1_tags": False,                    # no Level2.csv for Reliance
+        "split": REL_SPLIT_PRINTS,
+        "one_second": REL_ONE_SECOND,
+        "one_second_filename": REL_ONE_SECOND_FILENAME,
+        "mono_ts": True,                     # exchange-time based, strictly ordered
+        "vol_divisor": 1.0,                  # equity volume is already in shares
+        "est": REL_ENABLED and BN_EST_ENABLED,  # print + ~estimate rows, like the HTML Time & Sales
     }
 
 
@@ -456,7 +479,7 @@ def append_pipe_line(path: str, line: str):
 
 def write_l1_line(label: str, line: str):
     """Appends one data row to <label>/RawData.csv, writing the header first if new.
-    Also queues the row for the GitHub tick publisher (Bank Nifty only; other labels are ignored)."""
+    Also queues the row for the GitHub tick publisher (Bank Nifty & Reliance; other labels are ignored)."""
     path = get_raw_data_path(label)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     is_new_file = not os.path.exists(path) or os.path.getsize(path) == 0
@@ -553,7 +576,7 @@ def _new_state() -> dict:
         # 1-second OHLCV bucketing
         "one_second_ticks": {},           # epoch_sec -> list[(price, volume)]
         "one_second_last_flushed_epoch": None,
-        # ~estimate logic (Bank Nifty): previous trade price / quote and last message time
+        # ~estimate logic (Bank Nifty & Reliance): previous trade price / quote and last message time
         "p_ltp": 0.0,
         "p_bid": 0.0,
         "p_ask": 0.0,
@@ -655,7 +678,7 @@ def _extract_trade_datetime(message: dict):
 
 
 # =========================================================
-# --- Bank Nifty: print + ~estimate rows (same as the HTML Time & Sales) ---
+# --- Bank Nifty & Reliance: print + ~estimate rows (same as the HTML Time & Sales) ---
 # =========================================================
 def _aggressor(p, prev_p, b_pre, a_pre, b_now, a_now, last_side):
     """Buy (1) / sell (-1) decision. The quote that was live BEFORE the trade is the one it actually hit;
@@ -723,7 +746,7 @@ def _place_missed(p_prev, ltp, vol):
 
 
 def _handle_trade_with_estimates(symbol: str, state: dict, cfg: dict, message: dict, ltp: float, cum_vol: float):
-    """Bank Nifty trade handling.
+    """Bank Nifty & Reliance trade handling.
     Day volume only grows, so every increase is real traded volume:
       - last_traded_qty  = the last print, booked EXACTLY at ltp
       - the rest of the increase traded between two snapshots: its exact price is unknown, so it is booked
@@ -815,11 +838,11 @@ def handle_trade_message(message: dict):
     -> (if enabled for that symbol) bucketed into the 1-second OHLCV bar.
 
     Per-trade size is derived from the delta in Fyers' cumulative
-    'vol_traded_today' (units for futures; divided by vol_divisor if set).
+    'vol_traded_today' (units for futures/shares; divided by vol_divisor if set).
 
     IMPORTANT: the standard Fyers feed is a conflated snapshot feed, not a
     per-trade tape. Several trades between two snapshots become ONE row here
-    (last price, summed volume) for TCS. For Bank Nifty (cfg["est"]) the jump is
+    (last price, summed volume) for TCS. For Bank Nifty & Reliance (cfg["est"]) the jump is
     split into the exact last print + ~estimate rows (see _handle_trade_with_estimates)."""
     symbol = message.get("symbol")
     state = _state.get(symbol)
@@ -845,7 +868,7 @@ def handle_trade_message(message: dict):
     except (TypeError, ValueError):
         return
 
-    # Bank Nifty: print + ~estimate rows, same price levels as the HTML Time & Sales tape
+    # Bank Nifty & Reliance: print + ~estimate rows, same price levels as the HTML Time & Sales tape
     if cfg.get("est"):
         _handle_trade_with_estimates(symbol, state, cfg, message, float(ltp), cum_vol)
         return
@@ -883,8 +906,7 @@ def handle_trade_message(message: dict):
     if cfg["mono_ts"]:
         # Exchange trade second + a sub-second fraction derived from how long after
         # that second we received the message, forced to be strictly increasing
-        # within a second. (The old receipt-microseconds-only approach could wrap
-        # and write rows out of order whenever the feed lagged.)
+        # within a second.
         trade_dt = _extract_trade_datetime(message) or recv_now.replace(microsecond=0)
         epoch_sec = int(trade_dt.timestamp())
         lag = recv_now.timestamp() - epoch_sec
@@ -943,7 +965,7 @@ def handle_depth_message(message: dict):
     state = _state.get(symbol)
     cfg = INSTRUMENTS.get(symbol)
     if state is None or cfg is None or not cfg["depth"]:
-        return  # Level 1-only symbols (Bank Nifty) never write depth
+        return  # Level 1-only symbols (Bank Nifty & Reliance) never write depth
     label = cfg["label"]
 
     asks, bids = extract_depth_levels(message, DOM_LEVELS)
@@ -1229,7 +1251,7 @@ def download_file_from_github(local_path: str, drive_filename: str, folder_name:
 
     NOTE: the Contents API only returns inline base64 'content' for files up to
     ~1 MB, so larger files cannot be restored this way — another reason Bank
-    Nifty tick files should rely on Drive rather than GitHub."""
+    Nifty & Reliance tick files should rely on Drive rather than GitHub."""
     if not _github_configured():
         return False
     repo_path = get_github_repo_path(folder_name, drive_filename)
@@ -1296,6 +1318,10 @@ def build_sync_files() -> list:
         files.append((BN_LABEL, RAW_DATA_FILENAME, "bn_raw", BN_DRIVE_SYNC_INTERVAL_SECONDS))
         if BN_ONE_SECOND:
             files.append((BN_LABEL, BN_ONE_SECOND_FILENAME, "bn_1s", BN_DRIVE_SYNC_INTERVAL_SECONDS))
+    if REL_ENABLED:
+        files.append((REL_LABEL, RAW_DATA_FILENAME, "rel_raw", BN_DRIVE_SYNC_INTERVAL_SECONDS))
+        if REL_ONE_SECOND:
+            files.append((REL_LABEL, REL_ONE_SECOND_FILENAME, "rel_1s", BN_DRIVE_SYNC_INTERVAL_SECONDS))
     return files
 
 
@@ -1344,8 +1370,8 @@ async def cloud_sync_loop():
 # Trade prints are bucketed by their own trade-second into state["one_second_ticks"];
 # this loop finalizes/writes any bucket old enough (ONE_SECOND_BUFFER_SECONDS) that
 # no more late trades are expected. Seconds with no trades are SKIPPED.
-# Runs for every symbol with one_second enabled (TCS always; Bank Nifty only if
-# FYERS_BANKNIFTY_1S=true). Depth/Level2 data is never touched here.
+# Runs for every symbol with one_second enabled (TCS always; Bank Nifty / Reliance
+# only if enabled). Depth/Level2 data is never touched here.
 
 def flush_ready_one_second_bars():
     now_epoch = int(time.time())
@@ -1577,6 +1603,10 @@ async def main():
            f"{' + 1s bars' if BN_ONE_SECOND else ''}"
            f"{' + ~estimate rows (est_at=' + BN_EST_AT + ', tick=' + str(BN_TICK_SIZE) + ')' if BN_EST_ENABLED else ''}"
            if BN_ENABLED else " | Bank Nifty disabled")
+        + (f" | Reliance ({REL_SYMBOL}): L1 raw ticks"
+           f"{' + 1s bars' if REL_ONE_SECOND else ''}"
+           f"{' + ~estimate rows (est_at=' + BN_EST_AT + ', tick=' + str(BN_TICK_SIZE) + ')' if BN_EST_ENABLED else ''}"
+           if REL_ENABLED else " | Reliance disabled")
     )
 
     # Restore prior data BEFORE anything writes locally, so the first cloud
@@ -1601,7 +1631,7 @@ async def main():
         run_websocket_with_retry(),
         cloud_sync_loop(),
         one_second_timer_loop(),
-        ghticks.publisher_loop(),      # Bank Nifty ticks -> GitHub (5-minute files for the HTML chart)
+        ghticks.publisher_loop(),      # Bank Nifty & Reliance ticks -> GitHub (5-minute files for the HTML chart)
     ]
     if FYERS_DEPTH_SOURCE == "tbt":
         tasks.append(run_tbt_depth_with_retry())
