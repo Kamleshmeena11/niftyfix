@@ -1,11 +1,13 @@
 """
-github_tick_publisher.py  -  publishes the collector's Bank Nifty tick rows to GitHub, in small
-per-day / per-5-minute files that the HTML chart can read back (history) and keep in sync with live.
+github_tick_publisher.py  -  publishes the collector's Bank Nifty & Reliance tick rows to GitHub,
+in small per-day / per-5-minute files that the HTML chart can read back (history) and keep in sync with live.
 
-Layout in the repo (label = FYERS_BANKNIFTY_LABEL, default "banknifty"):
+Layout in the repo (labels = FYERS_BANKNIFTY_LABEL & FYERS_RELIANCE_LABEL, default "banknifty", "reliance"):
 
     data/banknifty/ticks/2026-11-16/0915.csv      <- every row whose time is 09:15:00 - 09:19:59
     data/banknifty/ticks/2026-11-16/0920.csv
+    data/reliance/ticks/2026-11-16/0915.csv
+    data/reliance/ticks/2026-11-16/0920.csv
     ...
 
 Each file holds rows exactly as the collector writes RawData.csv, WITHOUT a header line:
@@ -31,7 +33,7 @@ Environment variables (the first three are the ones your script already uses):
     GITHUB_TOKEN                  token with "Contents: read and write" on the repo
     GITHUB_REPOSITORY             "owner/repo"
     GITHUB_DATA_BRANCH            branch to write to (falls back to GITHUB_REF_NAME, then "main")
-    GITHUB_TICK_LABELS            comma list of instrument labels to publish (default: FYERS_BANKNIFTY_LABEL or "banknifty")
+    GITHUB_TICK_LABELS            comma list of instrument labels to publish (default: "banknifty,reliance")
     GITHUB_TICK_PUSH_SECONDS      how often the open chunk is pushed (default 60)
     GITHUB_TICK_CHUNK_MINUTES     chunk length, must divide 60 (default 5)
     GITHUB_TICK_DIR               root folder in the repo (default "data")
@@ -70,9 +72,14 @@ CLEANUP_HOURS = max(1.0, float(os.environ.get("GITHUB_TICK_CLEANUP_HOURS", "6"))
 SQUASH = os.environ.get("GITHUB_TICK_SQUASH", "false").strip().lower() in ("1", "true", "yes")
 DELETE_BATCH = 300                      # files removed per cleanup commit
 DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+_DEFAULT_LABELS = ",".join([
+    os.environ.get("FYERS_BANKNIFTY_LABEL", "banknifty"),
+    os.environ.get("FYERS_RELIANCE_LABEL", "reliance"),
+])
 LABELS = {
     x.strip().lower()
-    for x in os.environ.get("GITHUB_TICK_LABELS", os.environ.get("FYERS_BANKNIFTY_LABEL", "banknifty")).split(",")
+    for x in os.environ.get("GITHUB_TICK_LABELS", _DEFAULT_LABELS).split(",")
     if x.strip()
 }
 ENABLED = bool(TOKEN and REPO)
